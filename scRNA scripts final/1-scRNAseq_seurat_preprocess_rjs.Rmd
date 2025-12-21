@@ -1,0 +1,238 @@
+############################################################
+# Single-cell RNA-seq Preprocessing Pipeline (Seurat)
+# Author: Rebecca J. Salamon
+#
+# Purpose:
+#   Reproducible preprocessing of scRNA-seq data including
+#   QC, filtering, normalization, dimensionality reduction,
+#   cell cycle scoring, and doublet removal.
+#
+# How to run:
+#   source("scripts/01_preprocess_seurat.R")
+#
+# Inputs:
+#   data/rds/seurat_raw.rds   (or Cell Ranger filtered matrix)
+#
+# Outputs:
+#   results/seurat_preprocessed_singlets.rds
+############################################################
+
+############################################################
+# Setup
+############################################################
+
+set.seed(12345)
+options(stringsAsFactors = FALSE)
+
+############################################################
+# Load required packages
+############################################################
+
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(viridis)
+library(glmGamPoi)
+library(scDblFinder)
+library(SingleCellExperiment)
+
+############################################################
+# Load Seurat object
+############################################################
+
+# Expected input path (edit if needed)
+input_rds <- "data/rds/seurat_raw.rds"
+
+if (!file.exists(input_rds)) {
+  stop("Input Seurat object not found at: ", input_rds)
+}
+
+seurat_obj <- readRDS(input_rds)
+
+# Inspect sample identities
+print(table(seurat_obj$orig.ident))
+
+# Rename samples if necessary (edit mapping as needed)
+seurat_obj$orig.ident <- recode(
+  seurat_obj$orig.ident,
+  "RS01" = "saline",
+  "RS02" = "6OHDA"
+)
+
+print(table(seurat_obj$orig.ident))
+
+############################################################
+# Initial cell-level quality control
+############################################################
+
+# Summary statistics
+summary(seurat_obj$nFeature_RNA)
+summary(seurat_obj$nCount_RNA)
+
+# Filter empty droplets / very low-quality cells
+seurat_obj <- subset(
+  seurat_obj,
+  subset = nFeature_RNA > 200 & nCount_RNA > 500
+)
+
+cat("Cells after initial QC:", ncol(seurat_obj), "\n")
+
+############################################################
+# Mitochondrial gene content
+############################################################
+
+DefaultAssay(seurat_obj) <- "RNA"
+
+# Mouse: "^mt-" | Human: "^MT-"
+mt_pattern <- "^mt-"
+
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(
+  seurat_obj,
+  pattern = mt_pattern
+)
+
+initial_cells <- ncol(seurat_obj)
+
+summary(seurat_obj$percent.mt)
+
+############################################################
+# Cell filtering based on QC metrics
+############################################################
+
+seurat_obj <- subset(
+  seurat_obj,
+  subset =
+    nFeature_RNA > 200 &
+    nFeature_RNA < 5000 &
+    percent.mt < 5 &
+    !is.na(percent.mt)
+)
+
+filtered_cells <- ncol(seurat_obj)
+
+cat("Cells remaining after QC:", filtered_cells, "\n")
+cat(
+  "Percentage removed:",
+  round(100 * (initial_cells - filtered_cells) / initial_cells, 2),
+  "%\n"
+)
+
+############################################################
+# Feature (gene) filtering
+############################################################
+
+FilterGenes <- function(object, min.umi = 2, min.cells = 10) {
+  num.cells <- Matrix::rowSums(
+    GetAssayData(object, slot = "counts") >= min.umi
+  )
+  genes.use <- names(num.cells[num.cells >= min.cells])
+
+  if (length(genes.use) == 0) {
+    stop("No genes passed filtering criteria.")
+  }
+
+  subset(object, features = genes.use)
+}
+
+seurat_obj <- FilterGenes(
+  object = seurat_obj,
+  min.umi = 2,
+  min.cells = 10
+)
+
+############################################################
+# Normalization and dimensionality reduction (SCTransform)
+############################################################
+
+seurat_obj <- SCTransform(
+  seurat_obj,
+  vst.flavor = "v2",
+  method = "glmGamPoi",
+  variable.features.n = 4000,
+  ncells = 10000,
+  conserve.memory = TRUE,
+  verbose = TRUE
+)
+
+seurat_obj <- RunPCA(seurat_obj, verbose = TRUE)
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:50)
+seurat_obj <- FindClusters(seurat_obj)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:50)
+
+############################################################
+# Cell cycle scoring
+############################################################
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+seurat_obj <- CellCycleScoring(
+  seurat_obj,
+  s.features = s.genes,
+  g2m.features = g2m.genes,
+  set.ident = TRUE
+)
+
+print(table(seurat_obj$Phase))
+
+############################################################
+# Doublet detection with scDblFinder
+############################################################
+
+options(future.globals.maxSize = 1000 * 1024^2)
+
+DefaultAssay(seurat_obj) <- "SCT"
+Idents(seurat_obj) <- "seurat_clusters"
+
+sce <- as.SingleCellExperiment(seurat_obj)
+sce <- scDblFinder(sce)
+
+seurat_obj$scDblFinder.class <- sce$scDblFinder.class
+seurat_obj$scDblFinder.score <- sce$scDblFinder.score
+
+print(table(seurat_obj$scDblFinder.class))
+
+n_doublets <- sum(seurat_obj$scDblFinder.class == "doublet")
+n_total <- ncol(seurat_obj)
+
+cat("Doublets detected:", n_doublets, "of", n_total, "cells\n")
+cat(
+  "Doublet percentage:",
+  round(100 * n_doublets / n_total, 2),
+  "%\n"
+)
+
+# Keep singlets only
+seurat_obj <- subset(
+  seurat_obj,
+  subset = scDblFinder.class == "singlet"
+)
+
+############################################################
+# Recluster singlet dataset
+############################################################
+
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:50)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+
+############################################################
+# Save processed object
+############################################################
+
+output_dir <- "results"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+output_rds <- file.path(
+  output_dir,
+  "seurat_preprocessed_singlets.rds"
+)
+
+saveRDS(seurat_obj, output_rds)
+
+cat("Saved processed Seurat object to:", output_rds, "\n")
+
+############################################################
+# Session information (reproducibility)
+############################################################
+
+sessionInfo()

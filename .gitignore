@@ -1,0 +1,27 @@
+# data/output (keep big files out of git)
+data/raw/
+data/processed/
+results/
+
+# common single-cell outputs
+*.h5ad
+*.loom
+*.rds
+*.h5
+*.mtx
+*.fastq*
+*.bam
+*.sam
+
+# notebooks
+.ipynb_checkpoints/
+
+# python / r
+__pycache__/
+*.pyc
+.Rhistory
+.Rproj.user/
+
+# OS junk
+.DS_Store
+Thumbs.db
