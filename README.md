@@ -86,56 +86,52 @@ Each script writes outputs to `results/` and figures to `figures/` by default.
 - `results/cellchat_top_pathways.RData`
 
 ## How to run
-Run scripts in the following order:
-
-### 1. Immune reclustering and annotation
-
 Run the analysis in order using the `.Rmd` files in `notebooks/` (or render them to HTML). Each step writes outputs to `results/` and figures to `figures/` by default.
 
 ### 1. Preprocess
-1. `notebooks/01_scRNAseq_seurat_preprocess_rjs.Rmd`  
+`notebooks/01_scRNAseq_seurat_preprocess_rjs.Rmd`  
    - Loads raw feature-barcode matrices (e.g., 10x output)  
    - Performs initial QC filtering, normalization, and preprocessing  
    - Saves a processed Seurat object for downstream integration
 
 ### 2. Integration and clustering
-2. `notebooks/02_integration_clustering_rjs.Rmd`  
+`notebooks/02_integration_clustering_rjs.Rmd`  
    - Integrates samples/conditions (saline vs 6OHDA)  
    - Runs dimensional reduction (PCA/UMAP) and clustering  
    - Produces an integrated object used for compartment annotation/subsetting
 
 ### 3. Compartment level clustering
-3. `notebooks/03_cluster_subset_4_compartment_rjs.Rmd`  
+`notebooks/03_cluster_subset_4_compartment_rjs.Rmd`  
    - Defines four major compartments (Mesenchymal, Epithelial, Endothelial, Immune)  
    - Generates compartment-level UMAPs and summary plots  
    - Saves the 4-compartment annotated Seurat object used for lineage-specific analyses
 
 ### 4. Mesenchymal clustering
-4. `notebooks/04_mesenchymal_subcluster_analysis_rjs.Rmd`  
+`notebooks/04_mesenchymal_subcluster_analysis_rjs.Rmd`  
    - Subsets mesenchymal cells  
    - Reclusters and annotates mesenchymal subtypes (`mes_identity`)  
    - Exports mesenchymal cluster markers and/or differential expression outputs
 
 ### 5. Immune clustering
-5. `notebooks/05_immune_subcluster_analysis_rjs.Rmd`  
+`notebooks/05_immune_subcluster_analysis_rjs.Rmd`  
    - Subsets immune cells  
    - Reclusters and annotates immune identities (`imm_identity`)  
    - Exports immune cluster markers and/or differential expression outputs
 
 ### 6. Monocyte and Macrophage subclustering
-6. `notebooks/06_mono-mac_immune_subcluster_rjs.Rmd`  
+`notebooks/06_mono-mac_immune_subcluster_rjs.Rmd`  
    - Subsets mono/mac populations from the immune compartment  
    - Performs higher-resolution mono/mac subclustering  
    - Writes refined labels back into the merged object as `subcluster_identity`
 
 ### 7. Trajectory analysis in immmune 
-7. `notebooks/07_trajectory_analysis_immune_rjs.Rmd`  
+`notebooks/07_trajectory_analysis_immune_rjs.Rmd`  
    - Runs Slingshot pseudotime analysis on mono/mac subclusters  
    - Fits GAMs with tradeSeq to identify pseudotime-associated genes  
    - Saves trajectory objects and result tables/figures
 
 ### 8. Cell chat mesenchymal-immune
-8. `notebooks/08_cell_chat_immune_mesenchymal_rjs.Rmd`  
+`notebooks/08_cell_chat_immune_mesenchymal_rjs.Rmd`  
    - Builds CellChat objects per condition (saline vs 6OHDA)  
    - Uses a unified `celltype_fine` label:
      - Mesenchymal: `mes_identity`
