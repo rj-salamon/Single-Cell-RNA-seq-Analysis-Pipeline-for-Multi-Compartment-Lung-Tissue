@@ -1,0 +1,307 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# 08_cell_chat_immune_mesenchymal_rjs
+#
+# CellChat analysis for Mesenchymal ↔ Immune communication, split by condition.
+# Uses fine-grained labels:
+#   - Mesenchymal: mes_identity
+#   - Immune: subcluster_identity (mono/mac) when present, else imm_identity
+# Drops broad IM / AM labels from CellChat input.
+#
+# Inputs:
+#   results/seurat_obj_mesenchymal_immune_merged_annotated.rds
+#     - must contain: compartment, mes_identity, imm_identity, subcluster_identity, orig.ident
+#
+# Outputs (written to results/):
+#   results/mes_imm_for_cellchat.rds
+#   results/cellchat_list.rds
+#   results/cellchat_merged.rds
+#   results/cellchat_comm_netP_merged.csv
+#   results/cellchat_comm_net_lr_merged.csv
+#   results/cellchat_top_pathways.RData
+#   results/cellchat_pathway_scores.csv
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+
+  library(CellChat)
+  library(patchwork)
+  library(future)
+
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(RColorBrewer)
+
+  library(openxlsx)
+})
+
+# -----------------------------#
+# Config
+# -----------------------------#
+in_rds  <- file.path("results", "seurat_obj_mesenchymal_immune_merged_annotated.rds")
+out_dir <- "results"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+out_seu_cellchat <- file.path(out_dir, "mes_imm_for_cellchat.rds")
+out_cc_list      <- file.path(out_dir, "cellchat_list.rds")
+out_cc_merged    <- file.path(out_dir, "cellchat_merged.rds")
+out_comm_netp    <- file.path(out_dir, "cellchat_comm_netP_merged.csv")
+out_comm_lr      <- file.path(out_dir, "cellchat_comm_net_lr_merged.csv")
+out_top_paths    <- file.path(out_dir, "cellchat_top_pathways.RData")
+out_scores_csv   <- file.path(out_dir, "cellchat_pathway_scores.csv")
+
+min_cells_filter <- 10
+
+# Recommended for CellChat if you have enough RAM
+future::plan("multisession", workers = max(1, parallel::detectCores() - 1))
+
+# -----------------------------#
+# Helpers
+# -----------------------------#
+stop_if_missing <- function(path) {
+  if (!file.exists(path)) stop("Missing input: ", path, call. = FALSE)
+}
+
+require_meta <- function(obj, cols) {
+  missing <- setdiff(cols, colnames(obj@meta.data))
+  if (length(missing) > 0) {
+    stop("Missing required metadata columns: ", paste(missing, collapse = ", "), call. = FALSE)
+  }
+}
+
+# Find pathway + probability columns in a CellChat communication table
+get_path_prob_cols <- function(df) {
+  path_col <- intersect(c("pathway_name", "annotation", "pathway"), colnames(df))
+  if (length(path_col) == 0) stop("Cannot find pathway column in communication table.")
+  path_col <- path_col[1]
+
+  prob_col <- intersect(c("prob", "prob.mean", "weight"), colnames(df))
+  if (length(prob_col) == 0) stop("Cannot find probability/weight column in communication table.")
+  prob_col <- prob_col[1]
+
+  list(path_col = path_col, prob_col = prob_col)
+}
+
+# Total pathway score across all interactions
+get_pathway_scores_from_comm <- function(df) {
+  cols <- get_path_prob_cols(df)
+  aggregate(
+    df[[cols$prob_col]],
+    by    = list(pathway = df[[cols$path_col]]),
+    FUN   = sum,
+    na.rm = TRUE
+  ) |>
+    setNames(c("pathway", "score")) |>
+    (\(x) stats::setNames(x$score, x$pathway))()
+}
+
+# Build matrix: pathways (rows) x cell types (columns),
+# entry = total communication strength for that pathway involving that cell type (as sender or receiver)
+get_pathway_cell_mat_from_comm <- function(df, pathways, groups) {
+  cols     <- get_path_prob_cols(df)
+  path_col <- cols$path_col
+  prob_col <- cols$prob_col
+
+  mat <- matrix(
+    0,
+    nrow = length(pathways),
+    ncol = length(groups),
+    dimnames = list(pathways, groups)
+  )
+
+  for (p in pathways) {
+    sub_p <- df[df[[path_col]] == p, , drop = FALSE]
+    if (nrow(sub_p) == 0) next
+
+    for (g in groups) {
+      sel <- (sub_p$source == g) | (sub_p$target == g)
+      if (any(sel)) {
+        mat[p, g] <- sum(sub_p[[prob_col]][sel], na.rm = TRUE)
+      }
+    }
+  }
+  mat
+}
+
+# 0–1 row scaling (CellChat-like relative strength)
+scale_row_01 <- function(x) {
+  if (all(is.na(x))) return(x)
+  rng <- range(x, na.rm = TRUE)
+  if (rng[1] == rng[2]) return(rep(0, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+# -----------------------------#
+# Load input object
+# -----------------------------#
+stop_if_missing(in_rds)
+mis_obj <- readRDS(in_rds)
+
+require_meta(mis_obj, c("compartment", "orig.ident", "mes_identity", "imm_identity", "subcluster_identity"))
+
+# -----------------------------#
+# Build Seurat object used for CellChat
+# -----------------------------#
+mes_imm_obj <- subset(mis_obj, subset = compartment %in% c("Mesenchymal", "Immune"))
+if (ncol(mes_imm_obj) == 0) stop("No Mesenchymal/Immune cells found.", call. = FALSE)
+
+mes_idx <- mes_imm_obj$compartment == "Mesenchymal"
+imm_idx <- mes_imm_obj$compartment == "Immune"
+
+mes_imm_obj$celltype_fine <- NA_character_
+mes_imm_obj$celltype_fine[mes_idx] <- as.character(mes_imm_obj$mes_identity[mes_idx])
+
+imm_sub   <- as.character(mes_imm_obj$subcluster_identity)
+imm_major <- as.character(mes_imm_obj$imm_identity)
+
+imm_fine <- ifelse(!is.na(imm_sub) & imm_sub != "", imm_sub, imm_major)
+mes_imm_obj$celltype_fine[imm_idx] <- imm_fine[imm_idx]
+
+# Drop IM/AM broad labels and missing labels
+mes_imm_obj <- subset(
+  mes_imm_obj,
+  subset = !is.na(celltype_fine) & !(celltype_fine %in% c("IM", "AM"))
+)
+mes_imm_obj$celltype_fine <- droplevels(factor(mes_imm_obj$celltype_fine))
+
+if (any(is.na(mes_imm_obj$celltype_fine))) {
+  stop("celltype_fine contains NA after filtering.", call. = FALSE)
+}
+
+saveRDS(mes_imm_obj, out_seu_cellchat)
+
+# -----------------------------#
+# Split by condition
+# -----------------------------#
+seurat.list <- SplitObject(mes_imm_obj, split.by = "orig.ident")
+if (length(seurat.list) < 2) {
+  stop("Expected at least 2 conditions in orig.ident for comparison.", call. = FALSE)
+}
+
+# -----------------------------#
+# CellChat pipeline for one condition
+# -----------------------------#
+CellChatDB <- CellChatDB.mouse
+
+process_cellchat <- function(seu, cellchat_db = CellChatDB, min_cells = 10) {
+  DefaultAssay(seu) <- "RNA"
+  data.input <- GetAssayData(seu, assay = "RNA", slot = "counts")
+
+  meta <- seu@meta.data
+  meta <- meta[colnames(data.input), , drop = FALSE]
+  stopifnot(all(rownames(meta) == colnames(data.input)))
+
+  meta$celltype_fine <- droplevels(factor(meta$celltype_fine))
+  stopifnot(!any(is.na(meta$celltype_fine)))
+
+  cc <- createCellChat(
+    object   = data.input,
+    meta     = meta,
+    group.by = "celltype_fine"
+  )
+
+  cc@DB <- cellchat_db
+  cc@idents <- droplevels(factor(cc@idents))
+
+  cc <- subsetData(cc)
+  cc <- identifyOverExpressedGenes(cc)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc)
+  cc <- filterCommunication(cc, min.cells = min_cells)
+  cc <- computeCommunProbPathway(cc)
+  cc <- aggregateNet(cc)
+  cc <- netAnalysis_computeCentrality(cc, slot.name = "netP")
+
+  cc
+}
+
+# -----------------------------#
+# Run CellChat for each condition and merge
+# -----------------------------#
+cellchat.list <- lapply(seurat.list, process_cellchat, min_cells = min_cells_filter)
+names(cellchat.list) <- names(seurat.list)
+
+cellchat.merged <- mergeCellChat(cellchat.list, add.names = names(cellchat.list))
+
+saveRDS(cellchat.list, out_cc_list)
+saveRDS(cellchat.merged, out_cc_merged)
+
+# -----------------------------#
+# Export communication tables (netP and net)
+# -----------------------------#
+comm_netp_list <- subsetCommunication(cellchat.merged, slot.name = "netP")  # list by condition
+comm_net_list  <- subsetCommunication(cellchat.merged, slot.name = "net")   # list by condition
+
+comm_netp_df <- do.call(rbind, comm_netp_list)
+comm_net_df  <- do.call(rbind, comm_net_list)
+
+cond_sizes_netp <- vapply(comm_netp_list, nrow, integer(1))
+cond_sizes_net  <- vapply(comm_net_list,  nrow, integer(1))
+
+comm_netp_df$condition <- rep(names(comm_netp_list), times = cond_sizes_netp)
+comm_net_df$condition  <- rep(names(comm_net_list),  times = cond_sizes_net)
+
+write.csv(comm_netp_df, out_comm_netp, row.names = FALSE)
+write.csv(comm_net_df,  out_comm_lr,   row.names = FALSE)
+
+# -----------------------------#
+# Cell type ordering (Mes then Immune) for downstream plots
+# -----------------------------#
+tab_comp <- table(mes_imm_obj$celltype_fine, mes_imm_obj$compartment)
+
+mes_types <- rownames(tab_comp)[
+  apply(tab_comp, 1, function(x) which.max(x)) == which(colnames(tab_comp) == "Mesenchymal")
+]
+imm_types <- rownames(tab_comp)[
+  apply(tab_comp, 1, function(x) which.max(x)) == which(colnames(tab_comp) == "Immune")
+]
+imm_types <- setdiff(imm_types, c("IM", "AM"))
+id_order  <- c(mes_types, imm_types)
+
+# -----------------------------#
+# Top pathways (merged + per condition) and save
+# -----------------------------#
+scores_merged <- get_pathway_scores_from_comm(comm_netp_df)
+
+scores_by_condition <- lapply(names(comm_netp_list), function(nm) {
+  sc <- get_pathway_scores_from_comm(comm_netp_list[[nm]])
+  data.frame(pathway = names(sc), score = as.numeric(sc), condition = nm, stringsAsFactors = FALSE)
+}) |>
+  bind_rows()
+
+scores_all <- bind_rows(
+  scores_by_condition,
+  data.frame(pathway = names(scores_merged), score = as.numeric(scores_merged), condition = "merged", stringsAsFactors = FALSE)
+)
+
+write.csv(scores_all, out_scores_csv, row.names = FALSE)
+
+top20_merged <- names(sort(scores_merged, decreasing = TRUE)[1:min(20, length(scores_merged))])
+
+# Per-condition top20 + union
+top20_by_cond <- lapply(comm_netp_list, function(df) {
+  sc <- get_pathway_scores_from_comm(df)
+  names(sort(sc, decreasing = TRUE)[1:min(20, length(sc))])
+})
+top_union <- Reduce(union, top20_by_cond)
+
+top_paths <- list(
+  merged = top20_merged,
+  by_condition = top20_by_cond,
+  union = top_union
+)
+
+save(top_paths, file = out_top_paths)
+
+message("Done.\n",
+        "  Seurat input for CellChat: ", out_seu_cellchat, "\n",
+        "  CellChat list:             ", out_cc_list, "\n",
+        "  CellChat merged:           ", out_cc_merged, "\n",
+        "  netP comm table:           ", out_comm_netp, "\n",
+        "  net (LR-level) table:      ", out_comm_lr, "\n",
+        "  Top pathways:              ", out_top_paths, "\n",
+        "  Pathway scores:            ", out_scores_csv)

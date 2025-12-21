@@ -1,0 +1,318 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# 04_mesenchymal_subcluster_analysis_rjs.R 
+
+# Mesenchymal subclustering + markers + DE 
+# Author: Rebecca J. Salamon
+#
+# Inputs:
+#   results/seurat_obj_4_comp_cluster_subset.rds
+#
+# Outputs (all in results/ by default):
+#   results/mesenchymal_obj_reclustered.rds
+#   results/mesenchymal_obj_balanced_for_plotting.rds
+#   results/mesenchymal_top_markers_by_cluster.xlsx
+#   results/mesenchymal_all_markers.csv
+#   results/mesenchymal_cluster_DE_all.rds
+#   results/mesenchymal_cluster_DE_filtered.rds
+#   results/mesenchymal_DE_all_clusters.csv
+# =============================================================================
+
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(openxlsx)
+  library(glmGamPoi)
+})
+
+set.seed(12345)
+options(stringsAsFactors = FALSE)
+
+# -----------------------------
+# Parameters (EDIT THESE)
+# -----------------------------
+input_rds <- "results/seurat_obj_4_comp_cluster_subset.rds"
+
+out_dir <- "results"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Key outputs
+out_mes_rds          <- file.path(out_dir, "mesenchymal_obj_reclustered.rds")
+out_mes_bal_rds      <- file.path(out_dir, "mesenchymal_obj_balanced_for_plotting.rds")
+out_markers_xlsx     <- file.path(out_dir, "mesenchymal_top_markers_by_cluster.xlsx")
+out_all_markers_csv  <- file.path(out_dir, "mesenchymal_all_markers.csv")
+
+out_de_all_rds       <- file.path(out_dir, "mesenchymal_cluster_DE_all.rds")
+out_de_filt_rds      <- file.path(out_dir, "mesenchymal_cluster_DE_filtered.rds")
+out_de_all_csv       <- file.path(out_dir, "mesenchymal_DE_all_clusters.csv")
+
+# Columns
+condition_col <- "orig.ident"
+condition_levels <- c("saline", "6OHDA")
+
+# Mesenchymal re-clustering params
+sct_features <- 3000
+npcs <- 50
+dims_use <- 1:30
+resolution <- 0.4
+mes_prefix <- "Mes_"
+
+# Marker thresholds (within mesenchymal recluster)
+marker_min_pct <- 0.25
+marker_logfc   <- 0.25
+top_n_per_cluster <- 50
+
+# Differential expression within each Mes_* subcluster
+run_cluster_DE <- TRUE
+de_min_pct <- 0.25
+de_logfc_keep_all <- 0      # keep all, filter later
+de_logfc_filter   <- 0.2
+de_fdr_filter     <- 0.05
+
+# Soup gene removal (optional)
+# If you saved soup genes from the previous script, put that path here.
+# Otherwise set to NULL.
+soup_gene_table_csv <- file.path(out_dir, "soup_like_genes.csv")  # created by my prior script
+use_soup_filter <- file.exists(soup_gene_table_csv)
+
+# -----------------------------
+# Load object
+# -----------------------------
+if (!file.exists(input_rds)) stop("Input not found: ", input_rds)
+message("Loading: ", input_rds)
+merged_obj <- readRDS(input_rds)
+
+if (!"compartment" %in% colnames(merged_obj@meta.data)) {
+  stop("Expected 'compartment' column not found. Did you run the compartment script?")
+}
+
+# Ensure condition is consistent
+if (!condition_col %in% colnames(merged_obj@meta.data)) {
+  stop("Condition column not found: ", condition_col)
+}
+merged_obj[[condition_col]] <- factor(merged_obj[[condition_col]][, 1], levels = condition_levels)
+
+# -----------------------------
+# Subset Mesenchymal
+# -----------------------------
+message("Subsetting Mesenchymal compartment...")
+mesenchymal_obj <- subset(merged_obj, subset = compartment == "Mesenchymal")
+
+# Save original cluster for comparison
+if ("seurat_clusters" %in% colnames(mesenchymal_obj@meta.data)) {
+  mesenchymal_obj$original_cluster <- mesenchymal_obj$seurat_clusters
+}
+
+# -----------------------------
+# Re-run SCTransform + recluster (appropriate on subset)
+# -----------------------------
+DefaultAssay(mesenchymal_obj) <- "SCT"
+
+# In Seurat v5, re-running SCTransform on an object that already has SCT is fine,
+# but it will refit the model for this subset specifically (what you want here).
+message("Running SCTransform on mesenchymal subset...")
+mesenchymal_obj <- SCTransform(
+  mesenchymal_obj,
+  method = "glmGamPoi",
+  variable.features.n = sct_features,
+  conserve.memory = TRUE,
+  verbose = FALSE
+)
+
+message("Running PCA/Neighbors/Clusters/UMAP...")
+mesenchymal_obj <- mesenchymal_obj |>
+  RunPCA(npcs = npcs, verbose = FALSE) |>
+  FindNeighbors(dims = dims_use, verbose = FALSE) |>
+  FindClusters(resolution = resolution, verbose = FALSE) |>
+  RunUMAP(dims = dims_use, verbose = FALSE)
+
+# Create Mes_* labels
+mesenchymal_obj$mes_cluster <- paste0(mes_prefix, mesenchymal_obj$seurat_clusters)
+Idents(mesenchymal_obj) <- mesenchymal_obj$mes_cluster
+
+message("Mesenchymal recluster counts:")
+print(table(Idents(mesenchymal_obj)))
+
+# -----------------------------
+# Markers for mesenchymal subclusters
+# -----------------------------
+message("Finding markers for mesenchymal reclusters...")
+mesenchymal_obj <- PrepSCTFindMarkers(mesenchymal_obj)
+
+all_markers <- FindAllMarkers(
+  mesenchymal_obj,
+  assay = "SCT",
+  layer = "data",             # Seurat v5
+  only.pos = TRUE,
+  min.pct = marker_min_pct,
+  logfc.threshold = marker_logfc
+) %>%
+  as_tibble()
+
+write.csv(all_markers, out_all_markers_csv, row.names = FALSE)
+message("Saved all markers CSV: ", out_all_markers_csv)
+
+top_markers <- all_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = top_n_per_cluster, with_ties = FALSE) %>%
+  ungroup()
+
+# Write Excel workbook: one sheet per cluster
+message("Writing top markers Excel: ", out_markers_xlsx)
+wb <- createWorkbook()
+clusters <- unique(top_markers$cluster)
+
+for (cl in clusters) {
+  df <- top_markers %>%
+    filter(cluster == cl) %>%
+    arrange(desc(avg_log2FC))
+
+  sheet <- substr(paste0("Cluster_", cl), 1, 31)
+  addWorksheet(wb, sheet)
+  writeData(wb, sheet, df)
+}
+saveWorkbook(wb, out_markers_xlsx, overwrite = TRUE)
+
+# -----------------------------
+# Cluster annotation (your mapping)
+# -----------------------------
+cluster_annotations <- data.frame(
+  ClusterID   = paste0(mes_prefix, 0:10),
+  Compartment = rep("Mesenchymal", 11),
+  Identity    = c(
+    "Alveolar", "Fibrotic", "Transitional-Myofib", "Stress-activated",
+    "Adventitial", "Inflammatory", "Adventitial-Immune", "Perivascular",
+    "Peribronchial", "Mesothelial", "Pericyte"
+  ),
+  stringsAsFactors = FALSE
+)
+
+mesenchymal_obj$Mes_identity <- cluster_annotations$Identity[
+  match(mesenchymal_obj$mes_cluster, cluster_annotations$ClusterID)
+]
+
+# Keep also a Compartment label column for plotting convenience
+mesenchymal_obj$Compartment <- mesenchymal_obj$Mes_identity
+
+message("Annotated identities table:")
+print(table(mesenchymal_obj$Mes_identity, useNA = "ifany"))
+
+# -----------------------------
+# Balanced object for plotting (optional but useful)
+# -----------------------------
+min_cells <- min(table(mesenchymal_obj[[condition_col]][, 1]))
+set.seed(42)
+balanced_cells <- unlist(lapply(
+  split(Cells(mesenchymal_obj), mesenchymal_obj[[condition_col]][, 1]),
+  function(cells) sample(cells, min_cells)
+))
+mesenchymal_obj_balanced <- subset(mesenchymal_obj, cells = balanced_cells)
+saveRDS(mesenchymal_obj_balanced, out_mes_bal_rds)
+message("Saved balanced mesenchymal object: ", out_mes_bal_rds)
+
+# -----------------------------
+# Optional: load soup genes for removal in DE
+# -----------------------------
+soup_genes <- character(0)
+if (isTRUE(use_soup_filter)) {
+  soup_tbl <- read.csv(soup_gene_table_csv)
+  if (all(c("gene", "is_soup_like") %in% colnames(soup_tbl))) {
+    soup_genes <- soup_tbl$gene[isTRUE(soup_tbl$is_soup_like)]
+    message("Loaded soup genes: ", length(soup_genes))
+  } else {
+    message("Soup gene table missing expected columns; skipping soup filter.")
+  }
+}
+
+# -----------------------------
+# Differential expression: 6OHDA vs saline within each Mes_* cluster
+# -----------------------------
+condition_markers_all_list <- list()
+condition_markers_list     <- list()
+
+if (isTRUE(run_cluster_DE)) {
+  message("Running DE per mesenchymal subcluster (6OHDA vs saline)...")
+
+  # Make sure identities are orig.ident for FindMarkers comparisons
+  mesenchymal_obj[[condition_col]] <- factor(mesenchymal_obj[[condition_col]][, 1], levels = condition_levels)
+
+  cluster_names <- sort(unique(mesenchymal_obj$mes_cluster))
+
+  for (cl in cluster_names) {
+    message("  Cluster: ", cl)
+
+    sub_cl <- subset(mesenchymal_obj, subset = mes_cluster == cl)
+
+    counts <- table(sub_cl[[condition_col]][, 1])
+    if (!all(condition_levels %in% names(counts))) {
+      warning("    Skipping ", cl, " (missing one condition).")
+      condition_markers_all_list[[cl]] <- NA
+      condition_markers_list[[cl]]     <- NA
+      next
+    }
+
+    # IMPORTANT:
+    # Do NOT delete SCT and re-run SCTransform per cluster unless you have a strong reason.
+    # Here we reuse the subset-level SCT model (already refit above).
+    DefaultAssay(sub_cl) <- "SCT"
+    Idents(sub_cl) <- sub_cl[[condition_col]][, 1]
+
+    markers_all <- FindMarkers(
+      sub_cl,
+      ident.1 = "6OHDA",
+      ident.2 = "saline",
+      assay = "SCT",
+      layer = "data",               # Seurat v5
+      test.use = "wilcox",
+      min.pct = de_min_pct,
+      logfc.threshold = de_logfc_keep_all
+    ) %>%
+      rownames_to_column("gene") %>%
+      mutate(
+        p_val_adj = p.adjust(p_val, method = "fdr"),
+        is_soup = gene %in% soup_genes
+      ) %>%
+      filter(!is_soup)
+
+    markers_filtered <- markers_all %>%
+      filter(
+        p_val_adj < de_fdr_filter,
+        abs(avg_log2FC) > de_logfc_filter
+      ) %>%
+      arrange(p_val_adj)
+
+    condition_markers_all_list[[cl]] <- markers_all
+    condition_markers_list[[cl]]     <- markers_filtered
+
+    message("    DE genes (all): ", nrow(markers_all),
+            " | filtered: ", nrow(markers_filtered))
+  }
+}
+
+# Save DE bundles
+saveRDS(condition_markers_all_list, out_de_all_rds)
+saveRDS(condition_markers_list, out_de_filt_rds)
+message("Saved DE RDS (all): ", out_de_all_rds)
+message("Saved DE RDS (filtered): ", out_de_filt_rds)
+
+# Combine all “all DE” into one CSV (handy for searching)
+if (isTRUE(run_cluster_DE)) {
+  de_all_df <- bind_rows(lapply(names(condition_markers_all_list), function(cl) {
+    df <- condition_markers_all_list[[cl]]
+    if (!is.data.frame(df)) return(NULL)
+    df %>% mutate(cluster = cl)
+  }))
+  write.csv(de_all_df, out_de_all_csv, row.names = FALSE)
+  message("Saved combined DE CSV: ", out_de_all_csv)
+}
+
+# -----------------------------
+# Save updated mesenchymal object
+# -----------------------------
+saveRDS(mesenchymal_obj, out_mes_rds)
+message("Saved mesenchymal reclustered object: ", out_mes_rds)
+
+message("Done.")

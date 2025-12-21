@@ -1,0 +1,173 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# 02_integration_clustering_rjs
+#
+# Harmony Integration + Clustering (Seurat v5.3.0)
+# Author: Rebecca J. Salamon
+#
+# Assumes input is:
+# - singlets only
+# - already SCTransform-preprocessed
+#
+# Pipeline:
+# load → define batch → split → merge → PCA → Harmony
+# → UMAP / neighbors / clustering → markers → save
+# =============================================================================
+
+# -----------------------------
+# Libraries
+# -----------------------------
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(harmony)
+  library(dplyr)
+  library(ggplot2)
+})
+
+set.seed(12345)
+options(stringsAsFactors = FALSE)
+
+# -----------------------------
+# Parameters (EDIT PATHS HERE)
+# -----------------------------
+input_rds   <- "results/seurat_preprocessed_singlets.rds"
+output_rds  <- "results/seurat_obj_harmony_integrated_res0.2.rds"
+markers_csv <- "results/markers_harmony_res0.2.csv"   # set to NULL to skip
+
+batch_var   <- "orig.ident"   # existing metadata column
+batch_name  <- "Method"       # new column used for Harmony
+
+nfeatures   <- 3000
+npcs        <- 50
+dims_use    <- 1:50
+resolution  <- 0.2
+
+find_markers    <- TRUE
+only_pos        <- TRUE
+min_pct         <- 0.25
+logfc_threshold <- 0.25
+
+# -----------------------------
+# I/O checks
+# -----------------------------
+if (!file.exists(input_rds)) {
+  stop("Input file not found: ", input_rds)
+}
+
+dir.create(dirname(output_rds), recursive = TRUE, showWarnings = FALSE)
+if (!is.null(markers_csv)) {
+  dir.create(dirname(markers_csv), recursive = TRUE, showWarnings = FALSE)
+}
+
+# -----------------------------
+# Load object
+# -----------------------------
+message("Loading Seurat object: ", input_rds)
+seurat_obj <- readRDS(input_rds)
+
+if (!batch_var %in% colnames(seurat_obj@meta.data)) {
+  stop("batch_var not found in metadata: ", batch_var)
+}
+
+# Create batch column for Harmony
+seurat_obj[[batch_name]] <- factor(seurat_obj[[batch_var]][, 1])
+
+message("Batch counts:")
+print(table(seurat_obj[[batch_name]][, 1]))
+
+# -----------------------------
+# Split and merge
+# -----------------------------
+obj_list <- SplitObject(seurat_obj, split.by = batch_name)
+names(obj_list) <- levels(seurat_obj[[batch_name]][, 1])
+
+message("Merging objects...")
+merged_obj <- merge(
+  x = obj_list[[1]],
+  y = obj_list[2:length(obj_list)],
+  add.cell.ids = names(obj_list)
+)
+
+# -----------------------------
+# Harmony integration
+# -----------------------------
+DefaultAssay(merged_obj) <- "SCT"
+
+# Variable features may be lost during merge
+merged_obj <- FindVariableFeatures(
+  merged_obj,
+  selection.method = "vst",
+  nfeatures = nfeatures
+)
+
+merged_obj <- ScaleData(merged_obj, verbose = TRUE)
+merged_obj <- RunPCA(merged_obj, npcs = npcs, verbose = TRUE)
+
+merged_obj <- RunHarmony(
+  object = merged_obj,
+  group.by.vars = batch_name,
+  reduction.use = "pca",
+  dims.use = dims_use
+)
+
+# -----------------------------
+# UMAP / neighbors / clustering
+# -----------------------------
+merged_obj <- RunUMAP(
+  merged_obj,
+  reduction = "harmony",
+  dims = dims_use,
+  reduction.name = "umap_harmony",
+  reduction.key = "UMAPH_"
+)
+
+merged_obj <- FindNeighbors(
+  merged_obj,
+  reduction = "harmony",
+  dims = dims_use
+)
+
+merged_obj <- FindClusters(
+  merged_obj,
+  resolution = resolution
+)
+
+cluster_col <- paste0("harmony_snn_res.", resolution)
+merged_obj[[cluster_col]] <- Idents(merged_obj)
+
+message("Cluster counts:")
+print(table(merged_obj[[cluster_col]][, 1]))
+
+# -----------------------------
+# Marker finding (Seurat v5)
+# -----------------------------
+markers <- NULL
+if (isTRUE(find_markers)) {
+  message("Finding markers...")
+
+  Idents(merged_obj) <- merged_obj[[cluster_col]][, 1]
+
+  markers <- FindAllMarkers(
+    object = merged_obj,
+    assay = "SCT",
+    layer = "data",      # correct for Seurat 5
+    only.pos = only_pos,
+    min.pct = min_pct,
+    logfc.threshold = logfc_threshold
+  )
+
+  message("Markers found: ", nrow(markers))
+
+  if (!is.null(markers_csv)) {
+    write.csv(markers, markers_csv, row.names = FALSE)
+    message("Saved markers to: ", markers_csv)
+  }
+}
+
+# -----------------------------
+# Save object
+# -----------------------------
+saveRDS(merged_obj, output_rds)
+message("Saved integrated object to: ", output_rds)
+
+message("Harmony integration complete.")

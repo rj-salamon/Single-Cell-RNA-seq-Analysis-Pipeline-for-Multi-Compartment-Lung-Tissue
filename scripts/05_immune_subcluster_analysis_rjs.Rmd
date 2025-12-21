@@ -1,0 +1,462 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# 05_immune_subcluster_analysis_rjs.R
+#
+# Immune subclustering + markers + DE 
+# Author: Rebecca J. Salamon
+#
+# Purpose:
+#   Immune subclustering + markers + DE (6OHDA vs saline) + basic enrichment.
+#   Designed to build directly on your previous scripts:
+#     - Input: Seurat object that already has:
+#         * compartment metadata (4 compartments)
+#         * UMAP embedding on the integrated object
+#         * orig.ident values including "saline" and "6OHDA"
+#
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(openxlsx)
+  library(ggrepel)
+
+  # Enrichment (optional downstream)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(ReactomePA)
+  library(enrichplot)
+
+  # Heatmap + tables (optional)
+  library(pheatmap)
+  library(DT)
+  library(stringr)
+})
+
+set.seed(42)
+
+#-----------------------------#
+# CONFIG
+#-----------------------------#
+# Input from previous scripts (CHANGE if your pipeline writes a different name)
+INPUT_RDS <- file.path("RDS_object", "seurat_obj_4_comp_cluster_subset.rds")
+
+# Output folder (project-relative)
+OUT_DIR <- file.path("outputs", "05_immune_subcluster")
+
+# Basic parameters (match your style)
+SCT_METHOD <- "glmGamPoi"
+SCT_NFEATURES <- 3000
+
+PCA_NPCS <- 50
+DIMS_USE <- 1:30
+
+CLUSTER_RES <- 0.4
+
+# Differential expression thresholds
+DE_MIN_PCT <- 0.25
+DE_LFC_FILTER <- 0.5          # you used 0.5 in your immune script
+DE_PADJ <- 0.05
+
+#-----------------------------#
+# Helpers
+#-----------------------------#
+dir_create <- function(path) if (!dir.exists(path)) dir.create(path, recursive = TRUE)
+
+log_step <- function(...) cat(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " | ", ..., "\n", sep = "")
+
+stop_if_missing_cols <- function(obj, cols) {
+  missing <- setdiff(cols, colnames(obj@meta.data))
+  if (length(missing) > 0) {
+    stop("Missing required metadata columns: ", paste(missing, collapse = ", "))
+  }
+}
+
+pick_fc_col <- function(df) intersect(c("avg_log2FC","avg_logFC","log2FC","logFC"), names(df))[1]
+
+save_plot_png <- function(p, filename, width = 8, height = 6, dpi = 300) {
+  ggsave(filename, p, width = width, height = height, dpi = dpi)
+}
+
+#-----------------------------#
+# Output folders
+#-----------------------------#
+dir_create(OUT_DIR)
+dir_create(file.path(OUT_DIR, "plots"))
+dir_create(file.path(OUT_DIR, "tables"))
+dir_create(file.path(OUT_DIR, "rds"))
+
+#-----------------------------#
+# Load object from previous script
+#-----------------------------#
+log_step("Reading input: ", INPUT_RDS)
+merged_obj <- readRDS(INPUT_RDS)
+
+stop_if_missing_cols(merged_obj, c("compartment", "orig.ident"))
+log_step("Loaded object dims: ", paste(dim(merged_obj), collapse = " x "))
+
+# Ensure condition order is consistent across plotting / DE
+merged_obj$orig.ident <- factor(merged_obj$orig.ident, levels = c("saline", "6OHDA"))
+
+#-----------------------------#
+# Visualize 4-compartment UMAP (already exists from previous scripts)
+#-----------------------------#
+p_comp <- DimPlot(
+  merged_obj,
+  group.by = "compartment",
+  reduction = "umap",
+  label = FALSE
+) +
+  ggtitle("4 Compartments (from previous integration)")
+print(p_comp)
+save_plot_png(p_comp, file.path(OUT_DIR, "plots", "umap_4_compartments.png"))
+
+#-----------------------------#
+# Subset immune compartment
+#-----------------------------#
+log_step("Subsetting to Immune compartment")
+immune_obj <- subset(merged_obj, subset = compartment == "Immune")
+log_step("Immune subset dims: ", paste(dim(immune_obj), collapse = " x "))
+
+# Keep original cluster ids for comparison if present
+if ("seurat_clusters" %in% colnames(immune_obj@meta.data)) {
+  immune_obj$original_cluster <- immune_obj$seurat_clusters
+}
+
+# Condition check
+log_step("orig.ident counts in immune subset:")
+print(table(immune_obj$orig.ident, useNA = "ifany"))
+
+p_imm_cond <- DimPlot(immune_obj, group.by = "orig.ident", reduction = "umap") +
+  ggtitle("Immune cells split by condition (pre-recluster)")
+print(p_imm_cond)
+save_plot_png(p_imm_cond, file.path(OUT_DIR, "plots", "umap_immune_by_condition_pre.png"))
+
+#-----------------------------#
+# Re-cluster immune subset (SCT on subset)
+#-----------------------------#
+log_step("Re-running SCTransform on Immune subset (", SCT_METHOD, ")")
+DefaultAssay(immune_obj) <- "SCT"
+
+immune_obj <- SCTransform(
+  immune_obj,
+  method = SCT_METHOD,
+  variable.features.n = SCT_NFEATURES,
+  conserve.memory = TRUE,
+  verbose = FALSE
+)
+
+log_step("PCA/Neighbors/Clusters/UMAP on Immune subset")
+immune_obj <- immune_obj |>
+  RunPCA(npcs = PCA_NPCS, verbose = FALSE) |>
+  FindNeighbors(dims = DIMS_USE, verbose = FALSE) |>
+  FindClusters(resolution = CLUSTER_RES, verbose = FALSE) |>
+  RunUMAP(dims = DIMS_USE, verbose = FALSE)
+
+immune_obj$immune_cluster <- paste0("Immune_", immune_obj$seurat_clusters)
+Idents(immune_obj) <- immune_obj$immune_cluster
+
+p_imm_clusters <- DimPlot(immune_obj, label = TRUE) + ggtitle("Immune reclustered")
+print(p_imm_clusters)
+save_plot_png(p_imm_clusters, file.path(OUT_DIR, "plots", "umap_immune_reclustered.png"))
+
+#-----------------------------#
+# Feature plots (canonical immune markers you were using)
+#-----------------------------#
+log_step("Marker FeaturePlots (canonical immune markers)")
+
+genes_of_interest <- c(
+  "Ly6c2", "Ccr2",         # monocytes
+  "Adgre1", "Spp1",        # macrophage-ish
+  "Chil3", "Mrc1", "Apoe", # alveolar macrophage-ish
+  "Cx3cr1", "Lgals3", "Trem2"
+)
+genes_of_interest <- genes_of_interest[genes_of_interest %in% rownames(immune_obj)]
+
+if (length(genes_of_interest) > 0) {
+  for (g in genes_of_interest) {
+    p <- FeaturePlot(
+      immune_obj,
+      features = g,
+      reduction = "umap",
+      cols = c("lightgrey", "firebrick"),
+      pt.size = 0.8
+    ) + ggtitle(g)
+    print(p)
+    save_plot_png(p, file.path(OUT_DIR, "plots", paste0("feature_", g, ".png")), width = 7, height = 6)
+  }
+} else {
+  log_step("No genes_of_interest found in object rownames; skipping FeaturePlots.")
+}
+
+#-----------------------------#
+# Find cluster markers (top 50 per immune cluster)
+#-----------------------------#
+log_step("Finding immune cluster markers (FindAllMarkers)")
+
+immune_obj <- PrepSCTFindMarkers(immune_obj)
+
+all_markers <- FindAllMarkers(
+  immune_obj,
+  assay = "SCT",
+  slot = "data",
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+top_markers <- all_markers |>
+  group_by(cluster) |>
+  slice_max(order_by = avg_log2FC, n = 50, with_ties = FALSE) |>
+  ungroup()
+
+write.csv(top_markers, file.path(OUT_DIR, "tables", "immune_top50_markers_by_cluster.csv"), row.names = FALSE)
+
+# Excel export
+log_step("Writing Excel: immune_top_markers_by_cluster.xlsx")
+wb <- createWorkbook()
+for (cl in unique(top_markers$cluster)) {
+  df <- top_markers |>
+    filter(cluster == cl) |>
+    arrange(desc(avg_log2FC))
+  sheet <- substr(paste0("Cluster_", cl), 1, 31)
+  addWorksheet(wb, sheet)
+  writeData(wb, sheet, df)
+}
+saveWorkbook(wb, file.path(OUT_DIR, "tables", "immune_top_markers_by_cluster.xlsx"), overwrite = TRUE)
+
+#-----------------------------#
+# Differential expression: 6OHDA vs saline within each immune cluster
+# Notes:
+#   - This matches your approach: per-cluster re-SCTransform then FindMarkers
+#-----------------------------#
+log_step("Running per-cluster DE: 6OHDA vs saline")
+
+immune_markers_all_list <- list()
+immune_markers_list <- list()
+
+deg_summary <- data.frame(
+  immune_cluster = character(),
+  total_genes = integer(),
+  total_DEGs = integer(),
+  up_6OHDA = integer(),
+  up_saline = integer(),
+  stringsAsFactors = FALSE
+)
+
+cluster_names <- levels(immune_obj$immune_cluster)
+
+for (cl in cluster_names) {
+  log_step("DE cluster: ", cl)
+
+  subset_cluster <- subset(immune_obj, subset = immune_cluster == cl)
+  cc <- table(subset_cluster$orig.ident)
+
+  if (!all(c("saline", "6OHDA") %in% names(cc))) {
+    log_step("  Skipping (only one condition present)")
+    immune_markers_all_list[[cl]] <- NA
+    immune_markers_list[[cl]] <- NA
+    next
+  }
+
+  # Re-SCT per cluster for DE stability (your established approach)
+  DefaultAssay(subset_cluster) <- "RNA"
+  if ("SCT" %in% names(subset_cluster@assays)) subset_cluster[["SCT"]] <- NULL
+
+  subset_cluster <- SCTransform(
+    subset_cluster,
+    method = SCT_METHOD,
+    variable.features.n = SCT_NFEATURES,
+    conserve.memory = TRUE,
+    verbose = FALSE
+  )
+  Idents(subset_cluster) <- "orig.ident"
+
+  markers_all <- FindMarkers(
+    subset_cluster,
+    ident.1 = "6OHDA",
+    ident.2 = "saline",
+    assay = "SCT",
+    slot = "data",
+    test.use = "wilcox",
+    min.pct = DE_MIN_PCT,
+    logfc.threshold = 0
+  ) |>
+    rownames_to_column("gene") |>
+    mutate(p_val_adj = p.adjust(p_val, method = "fdr"))
+
+  fc_col <- pick_fc_col(markers_all)
+  if (is.na(fc_col)) stop("No logFC column found in markers_all for cluster ", cl)
+
+  markers_filtered <- markers_all |>
+    filter(
+      p_val_adj < DE_PADJ,
+      abs(.data[[fc_col]]) > DE_LFC_FILTER
+    ) |>
+    arrange(desc(abs(.data[[fc_col]])))
+
+  immune_markers_all_list[[cl]] <- markers_all
+  immune_markers_list[[cl]] <- markers_filtered
+
+  n_total_genes <- nrow(markers_all)
+  n_deg_total <- sum(markers_all$p_val_adj < DE_PADJ & abs(markers_all[[fc_col]]) > DE_LFC_FILTER, na.rm = TRUE)
+  n_up_6OHDA <- sum(markers_all$p_val_adj < DE_PADJ & markers_all[[fc_col]] > DE_LFC_FILTER, na.rm = TRUE)
+  n_up_saline <- sum(markers_all$p_val_adj < DE_PADJ & markers_all[[fc_col]] < -DE_LFC_FILTER, na.rm = TRUE)
+
+  deg_summary <- rbind(
+    deg_summary,
+    data.frame(
+      immune_cluster = cl,
+      total_genes = n_total_genes,
+      total_DEGs = n_deg_total,
+      up_6OHDA = n_up_6OHDA,
+      up_saline = n_up_saline
+    )
+  )
+}
+
+write.csv(deg_summary, file.path(OUT_DIR, "tables", "DEG_summary_6OHDA_vs_saline_by_immune_cluster.csv"), row.names = FALSE)
+
+# Excel export of filtered DEGs
+log_step("Writing Excel: Immune_Filtered_6OHDA_vs_saline_DEGs_by_cluster.xlsx")
+wb2 <- createWorkbook()
+
+for (cl in names(immune_markers_list)) {
+  df <- immune_markers_list[[cl]]
+  if (!is.data.frame(df) || !nrow(df)) next
+
+  sheet_name <- substr(paste0("DEG_", cl), 1, 31)
+  addWorksheet(wb2, sheet_name)
+  writeData(wb2, sheet_name, df)
+}
+saveWorkbook(wb2, file.path(OUT_DIR, "tables", "Immune_Filtered_6OHDA_vs_saline_DEGs_by_cluster.xlsx"), overwrite = TRUE)
+
+#-----------------------------#
+# OPTIONAL: Volcano for one cluster
+#-----------------------------#
+plot_volcano <- function(markers_all, cluster_id, out_png) {
+  if (!is.data.frame(markers_all) || !nrow(markers_all)) return(invisible(NULL))
+  fc_col <- pick_fc_col(markers_all)
+  if (is.na(fc_col)) return(invisible(NULL))
+
+  df <- markers_all |>
+    mutate(
+      neg_log10_padj = -log10(p_val_adj + 1e-300),
+      category = case_when(
+        p_val_adj < DE_PADJ & .data[[fc_col]] <= -DE_LFC_FILTER ~ "Up in saline",
+        p_val_adj < DE_PADJ & .data[[fc_col]] >=  DE_LFC_FILTER ~ "Up in 6OHDA",
+        TRUE ~ "Not significant"
+      )
+    )
+
+  p <- ggplot(df, aes(x = .data[[fc_col]], y = neg_log10_padj)) +
+    geom_point(aes(color = category), alpha = 0.75, size = 1.5) +
+    geom_vline(xintercept = c(-DE_LFC_FILTER, DE_LFC_FILTER), linetype = "dashed") +
+    geom_hline(yintercept = -log10(DE_PADJ), linetype = "dashed") +
+    scale_color_manual(values = c("Up in saline" = "red", "Up in 6OHDA" = "blue", "Not significant" = "grey70")) +
+    labs(
+      title = paste0("Volcano – ", cluster_id, " (6OHDA vs saline)"),
+      x = fc_col,
+      y = "-log10(FDR)"
+    ) +
+    theme_classic()
+
+  print(p)
+  save_plot_png(p, out_png, width = 7, height = 6)
+}
+
+# Example: change cluster id if you want
+EXAMPLE_VOLCANO_CLUSTER <- if (length(cluster_names) > 0) cluster_names[1] else NULL
+if (!is.null(EXAMPLE_VOLCANO_CLUSTER) && is.data.frame(immune_markers_all_list[[EXAMPLE_VOLCANO_CLUSTER]])) {
+  log_step("Making example volcano for: ", EXAMPLE_VOLCANO_CLUSTER)
+  plot_volcano(
+    immune_markers_all_list[[EXAMPLE_VOLCANO_CLUSTER]],
+    EXAMPLE_VOLCANO_CLUSTER,
+    file.path(OUT_DIR, "plots", paste0("volcano_", EXAMPLE_VOLCANO_CLUSTER, ".png"))
+  )
+}
+
+#-----------------------------#
+# OPTIONAL: Reactome enrichment helper for one cluster + direction
+#-----------------------------#
+run_immune_deg_pathway <- function(cluster_id, direction = c("saline", "6OHDA"), show_n = 15) {
+  direction <- match.arg(direction)
+  df <- immune_markers_list[[cluster_id]]
+  if (!is.data.frame(df) || !nrow(df)) stop("No filtered DEGs stored for ", cluster_id)
+
+  fc_col <- pick_fc_col(df)
+  if (is.na(fc_col)) stop("No logFC column found for ", cluster_id)
+
+  if (direction == "saline") {
+    genes <- df |>
+      filter(.data[[fc_col]] < 0) |>
+      pull(gene)
+  } else {
+    genes <- df |>
+      filter(.data[[fc_col]] > 0) |>
+      pull(gene)
+  }
+
+  genes <- unique(genes)
+  if (length(genes) < 3) stop("Too few genes for enrichment: ", cluster_id, " direction=", direction)
+
+  gene_map <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+  if (is.null(gene_map) || nrow(gene_map) == 0) stop("No ENTREZ mappings.")
+
+  e_react <- enrichPathway(
+    gene = gene_map$ENTREZID,
+    organism = "mouse",
+    pvalueCutoff = 1,
+    qvalueCutoff = 1,
+    pAdjustMethod = "BH"
+  )
+
+  if (is.null(e_react) || nrow(e_react@result) == 0) {
+    message("No Reactome enrichment for ", cluster_id, " (", direction, ")")
+    return(invisible(NULL))
+  }
+
+  p <- dotplot(e_react, showCategory = min(show_n, nrow(e_react@result))) +
+    ggtitle(paste0("Reactome ORA – Up in ", direction, " (", cluster_id, ")"))
+  print(p)
+  save_plot_png(p, file.path(OUT_DIR, "plots", paste0("reactome_", cluster_id, "_", direction, ".png")), width = 8, height = 5)
+
+  # save table
+  write.csv(
+    e_react@result,
+    file.path(OUT_DIR, "tables", paste0("reactome_", cluster_id, "_", direction, ".csv")),
+    row.names = FALSE
+  )
+
+  return(e_react)
+}
+
+# Example enrichment on first cluster (comment out if you don't want it)
+# if (!is.null(EXAMPLE_VOLCANO_CLUSTER)) {
+#   run_immune_deg_pathway(EXAMPLE_VOLCANO_CLUSTER, direction = "6OHDA")
+# }
+
+#-----------------------------#
+# Save outputs
+#-----------------------------#
+log_step("Saving immune subset RDS")
+saveRDS(immune_obj, file.path(OUT_DIR, "rds", "immune_subclustered.rds"))
+
+log_step("Saving DEG bundle RDS")
+saveRDS(
+  list(
+    immune_markers_all_list = immune_markers_all_list,
+    immune_markers_list = immune_markers_list,
+    deg_summary = deg_summary
+  ),
+  file.path(OUT_DIR, "rds", "immune_DEG_bundle.rds")
+)
+
+sess_path <- file.path(OUT_DIR, "sessionInfo.txt")
+log_step("Writing sessionInfo: ", sess_path)
+writeLines(c(capture.output(sessionInfo())), con = sess_path)
+
+log_step("Done.")

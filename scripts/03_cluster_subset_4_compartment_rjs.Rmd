@@ -1,0 +1,287 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# 03_cluster_subset_4_compartment_rjs
+#
+#Cluster analysis + compartment assignment (Seurat v5.3.0)
+# Author: Rebecca J. Salamon
+#
+# Inputs:
+#   results/seurat_obj_harmony_integrated_res0.2.rds   (from Harmony script)
+#
+# Outputs:
+#   results/seurat_obj_4_comp_cluster_subset.rds
+#   results/compartment_counts.csv (optional)
+#   results/soup_like_genes.csv (optional)
+#   results/plots/*.png (optional)
+# =============================================================================
+
+# -----------------------------
+# Libraries (keep minimal)
+# -----------------------------
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+
+set.seed(12345)
+options(stringsAsFactors = FALSE)
+
+# -----------------------------
+# Parameters (EDIT THESE)
+# -----------------------------
+input_rds  <- "results/seurat_obj_harmony_integrated_res0.2.rds"
+output_rds <- "results/seurat_obj_4_comp_cluster_subset.rds"
+
+# Use the cluster column created by the Harmony script
+# (it was saved as "harmony_snn_res.<resolution>")
+cluster_col_preferred <- "harmony_snn_res.0.2"
+
+# Plot/output controls
+make_plots <- TRUE
+plots_dir  <- "results/plots_cluster_analysis"
+
+# Optional tables
+save_compartment_counts_csv <- TRUE
+compartment_counts_csv <- "results/compartment_counts.csv"
+
+save_soup_genes_csv <- TRUE
+soup_genes_csv <- "results/soup_like_genes.csv"
+
+# Condition order (for split plots)
+condition_col <- "orig.ident"
+condition_levels <- c("saline", "6OHDA")
+
+# Marker genes for “map subsets”
+genes_of_interest <- c("Col1a1", "Col3a1", "Epcam", "Cdh1", "Ptprc", "Cldn5", "Pecam1")
+
+# Compartment definitions by cluster ID
+# NOTE: these are your provided cluster sets; update as needed.
+mesenchymal_clusters <- c(2)
+epithelial_clusters  <- c(5, 6, 10, 17, 19)
+endothelial_clusters <- c(0, 7, 8, 12, 16)
+immune_clusters      <- c(1, 3, 4, 9, 11, 13, 14, 15, 18, 20)
+
+# SOUP-like gene thresholding
+soup_expr_threshold <- 0.5          # expression cutoff per cluster avg
+soup_pct_clusters   <- 80           # % clusters expressed above threshold to call “soup-like”
+
+# -----------------------------
+# Helpers
+# -----------------------------
+dir_create <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+}
+
+save_plot <- function(p, filename, width = 7, height = 5) {
+  ggsave(filename = filename, plot = p, width = width, height = height, dpi = 300)
+}
+
+# -----------------------------
+# Load object
+# -----------------------------
+if (!file.exists(input_rds)) stop("Input not found: ", input_rds)
+dir_create(dirname(output_rds))
+if (isTRUE(make_plots)) dir_create(plots_dir)
+if (isTRUE(save_compartment_counts_csv)) dir_create(dirname(compartment_counts_csv))
+if (isTRUE(save_soup_genes_csv)) dir_create(dirname(soup_genes_csv))
+
+message("Loading: ", input_rds)
+merged_obj <- readRDS(input_rds)
+
+message("Default assay: ", DefaultAssay(merged_obj))
+message("Metadata columns include: ", paste(head(colnames(merged_obj@meta.data), 25), collapse = ", "))
+
+# -----------------------------
+# Set identities to the chosen clustering
+# -----------------------------
+if (cluster_col_preferred %in% colnames(merged_obj@meta.data)) {
+  Idents(merged_obj) <- merged_obj[[cluster_col_preferred]][, 1]
+  message("Set Idents() from: ", cluster_col_preferred)
+} else if ("seurat_clusters" %in% colnames(merged_obj@meta.data)) {
+  Idents(merged_obj) <- "seurat_clusters"
+  message("WARNING: ", cluster_col_preferred, " not found; falling back to seurat_clusters.")
+} else {
+  stop("No cluster column found. Expected ", cluster_col_preferred, " or seurat_clusters.")
+}
+
+message("Cluster counts:")
+print(table(Idents(merged_obj)))
+
+# -----------------------------
+# Ensure condition column is a factor with desired order
+# -----------------------------
+if (condition_col %in% colnames(merged_obj@meta.data)) {
+  merged_obj[[condition_col]] <- factor(merged_obj[[condition_col]][, 1], levels = condition_levels)
+} else {
+  message("WARNING: condition column not found: ", condition_col)
+}
+
+# -----------------------------
+# Basic UMAP plot
+# -----------------------------
+if (isTRUE(make_plots)) {
+  p1 <- DimPlot(merged_obj, reduction = "umap_harmony", label = TRUE) +
+    ggtitle("Harmony UMAP (labeled clusters)") +
+    theme_minimal()
+  save_plot(p1, file.path(plots_dir, "umap_clusters_labeled.png"), width = 7, height = 6)
+
+  if (condition_col %in% colnames(merged_obj@meta.data)) {
+    p2 <- DimPlot(merged_obj, reduction = "umap_harmony", group.by = condition_col, label = FALSE) +
+      ggtitle("Harmony UMAP by condition") +
+      theme_minimal()
+    save_plot(p2, file.path(plots_dir, "umap_by_condition.png"), width = 7, height = 6)
+  }
+}
+
+# -----------------------------
+# Map subsets based on key genes (FeaturePlot split by condition)
+# -----------------------------
+if (isTRUE(make_plots) && condition_col %in% colnames(merged_obj@meta.data)) {
+  DefaultAssay(merged_obj) <- "SCT"
+
+  for (gene in genes_of_interest) {
+    if (!gene %in% rownames(merged_obj)) {
+      message("Skipping missing gene: ", gene)
+      next
+    }
+
+    p <- FeaturePlot(
+      merged_obj,
+      features = gene,
+      reduction = "umap_harmony",
+      split.by = condition_col,
+      pt.size = 0.6
+    ) +
+      ggtitle(paste("Expression of", gene, "(split by", condition_col, ")")) +
+      theme_minimal()
+
+    save_plot(p, file.path(plots_dir, paste0("feature_", gene, "_split.png")), width = 10, height = 5)
+  }
+}
+
+# -----------------------------
+# Set compartment identities (broad compartments)
+# -----------------------------
+# Make sure cluster IDs are numeric for comparisons
+cluster_ids <- as.integer(as.character(Idents(merged_obj)))
+if (any(is.na(cluster_ids))) {
+  # If clusters are not numeric strings, this will fail; keep as character and match differently
+  # But your cluster sets are numeric, so we require numeric clusters.
+  stop("Cluster identities are not numeric. Current Idents() look like: ",
+       paste(head(unique(Idents(merged_obj))), collapse = ", "))
+}
+merged_obj$cluster_id <- cluster_ids
+
+merged_obj$compartment <- NA_character_
+merged_obj$compartment[merged_obj$cluster_id %in% mesenchymal_clusters] <- "Mesenchymal"
+merged_obj$compartment[merged_obj$cluster_id %in% epithelial_clusters]  <- "Epithelial"
+merged_obj$compartment[merged_obj$cluster_id %in% endothelial_clusters] <- "Endothelial"
+merged_obj$compartment[merged_obj$cluster_id %in% immune_clusters]      <- "Immune"
+merged_obj$compartment <- factor(
+  merged_obj$compartment,
+  levels = c("Mesenchymal", "Epithelial", "Endothelial", "Immune")
+)
+
+# Warn if some clusters were not assigned
+unassigned <- sum(is.na(merged_obj$compartment))
+if (unassigned > 0) {
+  message("WARNING: ", unassigned, " cells have NA compartment (some clusters not in your lists).")
+}
+
+# Plot compartments
+if (isTRUE(make_plots)) {
+  p_comp <- DimPlot(
+    merged_obj,
+    reduction = "umap_harmony",
+    group.by = "compartment",
+    label = FALSE,
+    repel = TRUE
+  ) +
+    ggtitle("Broad compartments") +
+    theme_minimal()
+
+  save_plot(p_comp, file.path(plots_dir, "umap_by_compartment.png"), width = 7, height = 6)
+
+  if (condition_col %in% colnames(merged_obj@meta.data)) {
+    p_comp_split <- DimPlot(
+      merged_obj,
+      reduction = "umap_harmony",
+      group.by = "compartment",
+      split.by = condition_col
+    ) +
+      ggtitle("Compartments split by condition") +
+      theme_minimal()
+
+    save_plot(p_comp_split, file.path(plots_dir, "umap_compartment_split_by_condition.png"), width = 10, height = 5)
+  }
+}
+
+# -----------------------------
+# Compartment counts table
+# -----------------------------
+if (condition_col %in% colnames(merged_obj@meta.data)) {
+  compartment_counts <- merged_obj@meta.data %>%
+    count(.data[[condition_col]], compartment) %>%
+    pivot_wider(names_from = .data[[condition_col]], values_from = n, values_fill = 0)
+
+  message("Compartment counts:")
+  print(compartment_counts)
+
+  if (isTRUE(save_compartment_counts_csv)) {
+    write.csv(compartment_counts, compartment_counts_csv, row.names = FALSE)
+    message("Saved compartment counts CSV: ", compartment_counts_csv)
+  }
+} else {
+  message("Skipping compartment count table: condition column not found: ", condition_col)
+}
+
+# -----------------------------
+# Identify SOUP-like genes
+# -----------------------------
+DefaultAssay(merged_obj) <- "SCT"
+
+# Ensure clustering idents are clusters (not compartments) for AverageExpression
+# (AverageExpression groups by Idents by default)
+Idents(merged_obj) <- merged_obj$cluster_id
+
+cluster_avg <- AverageExpression(
+  merged_obj,
+  assays = "SCT",
+  layer = "data",        # Seurat v5
+  return.seurat = FALSE
+)
+
+expr_mat <- cluster_avg$SCT
+if (is.null(rownames(expr_mat))) rownames(expr_mat) <- rownames(merged_obj[["SCT"]])
+
+# Soup metric: number of clusters where avg expression > threshold
+gene_cluster_counts <- rowSums(expr_mat > soup_expr_threshold)
+pct_clusters <- 100 * gene_cluster_counts / ncol(expr_mat)
+
+soup_gene_table <- data.frame(
+  gene = rownames(expr_mat),
+  num_clusters_expressed = gene_cluster_counts,
+  pct_clusters_expressed = pct_clusters,
+  is_soup_like = pct_clusters > soup_pct_clusters,
+  stringsAsFactors = FALSE
+)
+
+soup_genes <- soup_gene_table$gene[soup_gene_table$is_soup_like]
+message("Identified soup-like genes: ", length(soup_genes))
+
+# Save soup genes table
+if (isTRUE(save_soup_genes_csv)) {
+  write.csv(soup_gene_table[order(-soup_gene_table$pct_clusters_expressed), ],
+            soup_genes_csv, row.names = FALSE)
+  message("Saved soup-like gene table: ", soup_genes_csv)
+}
+
+# -----------------------------
+# Save updated object
+# -----------------------------
+saveRDS(merged_obj, output_rds)
+message("Saved updated object to: ", output_rds)
+
+message("Cluster analysis complete.")

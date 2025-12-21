@@ -1,0 +1,182 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# 06_mono-mac_immune_subcluster_rjs
+#
+# Immune compartment reclustering + monocyte/macrophage subclustering.
+#
+# Inputs:
+#   results/seurat_obj_mesenchymal_immune_merged.rds
+#
+# Outputs (written to results/):
+#   results/immune_obj_reclustered.rds
+#   results/mono_mac_obj_subclustered.rds
+#   results/seurat_obj_mesenchymal_immune_merged_annotated.rds
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(glmGamPoi)
+})
+
+# -----------------------------#
+# Config
+# -----------------------------#
+in_rds  <- file.path("results", "seurat_obj_mesenchymal_immune_merged.rds")
+out_dir <- "results"
+
+out_immune_rds   <- file.path(out_dir, "immune_obj_reclustered.rds")
+out_mono_rds     <- file.path(out_dir, "mono_mac_obj_subclustered.rds")
+out_merged_rds   <- file.path(out_dir, "seurat_obj_mesenchymal_immune_merged_annotated.rds")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------------#
+# Helpers
+# -----------------------------#
+stop_if_missing <- function(path) {
+  if (!file.exists(path)) stop("Missing input: ", path, call. = FALSE)
+}
+
+# -----------------------------#
+# Load
+# -----------------------------#
+stop_if_missing(in_rds)
+obj <- readRDS(in_rds)
+
+if (!all(c("compartment", "orig.ident") %in% colnames(obj@meta.data))) {
+  stop("Input object must contain metadata columns: compartment, orig.ident", call. = FALSE)
+}
+
+# -----------------------------#
+# Immune subset
+# -----------------------------#
+immune_obj <- subset(obj, subset = compartment == "Immune")
+if (ncol(immune_obj) == 0) stop("No immune cells found (compartment == 'Immune').", call. = FALSE)
+
+immune_obj$orig.ident <- factor(immune_obj$orig.ident, levels = c("saline", "6OHDA"))
+
+# -----------------------------#
+# Immune recluster (SCT -> PCA -> UMAP/Neighbors/Clusters)
+# -----------------------------#
+DefaultAssay(immune_obj) <- "SCT"
+
+immune_obj <- SCTransform(
+  immune_obj,
+  method = "glmGamPoi",
+  variable.features.n = 3000,
+  conserve.memory = TRUE,
+  verbose = FALSE
+)
+
+immune_obj <- immune_obj |>
+  RunPCA(npcs = 50, verbose = FALSE) |>
+  FindNeighbors(dims = 1:30, verbose = FALSE) |>
+  FindClusters(resolution = 0.4, verbose = FALSE) |>
+  RunUMAP(dims = 1:30, verbose = FALSE)
+
+immune_obj$immune_cluster <- paste0("Immune_", immune_obj$seurat_clusters)
+Idents(immune_obj) <- "immune_cluster"
+
+# -----------------------------#
+# Annotate immune clusters (edit this mapping as needed)
+# -----------------------------#
+cluster_annotations <- data.frame(
+  ClusterID = paste0("Immune_", 0:21),
+  Identity  = c(
+    "B.Naive", "T.CD8", "T.CD4", "IM", "cDC1", "Treg", "NK.Cytotoxic",
+    "Neu.Inflam", "cDC2", "ILC2.Th2", "AM", "B.Naive2", "DC.Migratory",
+    "cDC2.Activated", "CD4.T.Activated", "T.gd17", "Prolif.Lymph", "Mono",
+    "Contam", "Plasma", "Cycling.Lymph", "pDC"
+  ),
+  stringsAsFactors = FALSE
+)
+
+immune_obj$Immune_identity <- cluster_annotations$Identity[
+  match(immune_obj$immune_cluster, cluster_annotations$ClusterID)
+]
+
+# Drop contaminant label if present
+immune_obj <- subset(immune_obj, subset = Immune_identity != "Contam")
+immune_obj$Immune_identity <- droplevels(factor(immune_obj$Immune_identity))
+
+# Save immune object
+saveRDS(immune_obj, out_immune_rds)
+
+# -----------------------------#
+# Mono/Mac subset and subcluster
+# -----------------------------#
+mono_keep <- c("Immune_3", "Immune_10", "Immune_17")  # IM, AM, Mono (based on cluster_annotations above)
+
+Idents(immune_obj) <- "immune_cluster"
+mono_obj <- subset(immune_obj, idents = mono_keep)
+if (ncol(mono_obj) == 0) stop("No mono/mac cells found in selected immune clusters.", call. = FALSE)
+
+DefaultAssay(mono_obj) <- "RNA"
+mono_obj <- SCTransform(
+  mono_obj,
+  method = "glmGamPoi",
+  variable.features.n = 2000,
+  return.only.var.genes = FALSE,
+  verbose = FALSE
+)
+
+DefaultAssay(mono_obj) <- "SCT"
+
+mono_obj <- mono_obj |>
+  RunPCA(verbose = FALSE) |>
+  FindNeighbors(dims = 1:20, verbose = FALSE) |>
+  FindClusters(resolution = 0.15, verbose = FALSE) |>
+  RunUMAP(dims = 1:20, verbose = FALSE)
+
+# Optional: remove one unwanted subcluster by numeric id (edit/remove as needed)
+if ("4" %in% levels(Idents(mono_obj))) {
+  mono_obj <- subset(mono_obj, idents = setdiff(levels(mono_obj), "4"))
+  mono_obj <- mono_obj |>
+    RunUMAP(dims = 1:20, verbose = FALSE) |>
+    FindNeighbors(dims = 1:20, verbose = FALSE) |>
+    FindClusters(resolution = 0.2, verbose = FALSE)
+}
+
+# Rename mono/mac subclusters (edit to match your biology)
+mono_obj <- RenameIdents(
+  mono_obj,
+  "0" = "IM.AM.Trans",
+  "1" = "Mo.IM",
+  "2" = "AM.Pparg^hi",
+  "3" = "AM.Spp1^hi",
+  "4" = "Mono"
+)
+
+mono_obj <- subset(
+  mono_obj,
+  idents = c("IM.AM.Trans", "Mo.IM", "AM.Pparg^hi", "AM.Spp1^hi", "Mono")
+)
+
+mono_obj$subcluster_identity <- as.character(Idents(mono_obj))
+saveRDS(mono_obj, out_mono_rds)
+
+# -----------------------------#
+# Write subcluster labels back into the merged object
+# -----------------------------#
+obj$subcluster_identity <- NA_character_
+
+mono_sub <- mono_obj$subcluster_identity
+names(mono_sub) <- colnames(mono_obj)
+
+common_cells <- intersect(names(mono_sub), colnames(obj))
+if (length(common_cells) == 0) stop("No overlapping barcodes between mono_obj and merged object.", call. = FALSE)
+
+obj$subcluster_identity[common_cells] <- mono_sub[common_cells]
+obj$subcluster_identity <- factor(
+  obj$subcluster_identity,
+  levels = c("IM.AM.Trans", "Mo.IM", "AM.Pparg^hi", "AM.Spp1^hi", "Mono")
+)
+
+saveRDS(obj, out_merged_rds)
+
+message("Done.\n",
+        "  Immune reclustered object: ", out_immune_rds, "\n",
+        "  Mono/Mac subclustered obj: ", out_mono_rds, "\n",
+        "  Annotated merged object:   ", out_merged_rds)

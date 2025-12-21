@@ -1,0 +1,250 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# 07_trajectory_analysis_immune_rjs
+#
+# Monocyte/macrophage trajectory analysis using Slingshot + tradeSeq.
+#
+# Inputs:
+#   results/immune_obj_reclustered.rds
+#     - must contain: compartment == "Immune" already subsetted OR an immune-only object
+#     - metadata columns used here: immune_cluster, Immune_identity, orig.ident
+#     - UMAP reduction present (or will be computed during this script)
+#
+# Outputs (written to results/):
+#   results/mono_mac_obj_for_trajectory.rds
+#   results/mono_mac_markers_all.csv
+#   results/mono_mac_top_markers_by_cluster.xlsx
+#   results/slingshot_sce.rds
+#   results/tradeseq_fitGAM.rds
+#   results/tradeseq_association_results.csv
+#   results/tradeseq_significant_genes.txt
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+
+  library(SingleCellExperiment)
+  library(slingshot)
+
+  library(tradeSeq)
+
+  library(openxlsx)
+  library(SummarizedExperiment)
+})
+
+# -----------------------------#
+# Config
+# -----------------------------#
+in_rds  <- file.path("results", "immune_obj_reclustered.rds")
+out_dir <- "results"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+out_mono_rds      <- file.path(out_dir, "mono_mac_obj_for_trajectory.rds")
+out_markers_csv   <- file.path(out_dir, "mono_mac_markers_all.csv")
+out_markers_xlsx  <- file.path(out_dir, "mono_mac_top_markers_by_cluster.xlsx")
+out_sce_rds       <- file.path(out_dir, "slingshot_sce.rds")
+out_gam_rds       <- file.path(out_dir, "tradeseq_fitGAM.rds")
+out_assoc_csv     <- file.path(out_dir, "tradeseq_association_results.csv")
+out_sig_txt       <- file.path(out_dir, "tradeseq_significant_genes.txt")
+
+# Key parameters (edit as needed)
+mono_mac_clusters <- c("Immune_3", "Immune_10", "Immune_17")
+sct_features_n    <- 2000
+dims_use          <- 1:20
+res_pre_drop      <- 0.15
+res_post_drop     <- 0.20
+drop_cluster_id   <- "4"       # cluster to remove after subclustering (set to NULL to skip)
+start_cluster     <- "Mo.IM"   # slingshot start cluster label (after renaming)
+nknots            <- 6
+padj_cutoff       <- 0.05
+
+# -----------------------------#
+# Helpers
+# -----------------------------#
+stop_if_missing <- function(path) {
+  if (!file.exists(path)) stop("Missing input: ", path, call. = FALSE)
+}
+
+require_meta <- function(obj, cols) {
+  missing <- setdiff(cols, colnames(obj@meta.data))
+  if (length(missing) > 0) {
+    stop("Missing required metadata columns: ", paste(missing, collapse = ", "), call. = FALSE)
+  }
+}
+
+# -----------------------------#
+# Load
+# -----------------------------#
+stop_if_missing(in_rds)
+immune_obj <- readRDS(in_rds)
+
+require_meta(immune_obj, c("orig.ident", "immune_cluster", "Immune_identity"))
+
+immune_obj$orig.ident <- factor(immune_obj$orig.ident, levels = c("saline", "6OHDA"))
+
+# -----------------------------#
+# Subset mono/mac
+# -----------------------------#
+Idents(immune_obj) <- "immune_cluster"
+mono_obj <- subset(immune_obj, idents = mono_mac_clusters)
+if (ncol(mono_obj) == 0) stop("No cells found in mono_mac_clusters.", call. = FALSE)
+
+# Ensure UMAP exists (compute if missing)
+if (!"umap" %in% Reductions(mono_obj)) {
+  DefaultAssay(mono_obj) <- "SCT"
+  if (!"pca" %in% Reductions(mono_obj)) {
+    mono_obj <- RunPCA(mono_obj, verbose = FALSE)
+  }
+  mono_obj <- RunUMAP(mono_obj, dims = dims_use, verbose = FALSE)
+}
+
+# -----------------------------#
+# Re-SCTransform + subcluster
+# -----------------------------#
+DefaultAssay(mono_obj) <- "RNA"
+mono_obj <- SCTransform(
+  mono_obj,
+  method = "glmGamPoi",
+  variable.features.n = sct_features_n,
+  return.only.var.genes = FALSE,
+  verbose = FALSE
+)
+
+DefaultAssay(mono_obj) <- "SCT"
+
+mono_obj <- mono_obj |>
+  RunPCA(verbose = FALSE) |>
+  FindNeighbors(dims = dims_use, verbose = FALSE) |>
+  FindClusters(resolution = res_pre_drop, verbose = FALSE) |>
+  RunUMAP(dims = dims_use, verbose = FALSE)
+
+# Optional drop of one numeric cluster id
+if (!is.null(drop_cluster_id) && drop_cluster_id %in% levels(Idents(mono_obj))) {
+  mono_obj <- subset(mono_obj, idents = setdiff(levels(Idents(mono_obj)), drop_cluster_id))
+  mono_obj <- mono_obj |>
+    FindNeighbors(dims = dims_use, verbose = FALSE) |>
+    FindClusters(resolution = res_post_drop, verbose = FALSE) |>
+    RunUMAP(dims = dims_use, verbose = FALSE)
+}
+
+# Rename subclusters (edit mapping to match your results)
+mono_obj <- RenameIdents(
+  mono_obj,
+  "0" = "IM.AM.Trans",
+  "1" = "Mo.IM",
+  "2" = "AM.Pparg^hi",
+  "3" = "AM.Spp1^hi",
+  "4" = "Mono"
+)
+
+mono_obj <- subset(
+  mono_obj,
+  idents = c("IM.AM.Trans", "Mo.IM", "AM.Pparg^hi", "AM.Spp1^hi", "Mono")
+)
+
+mono_obj$subcluster_identity <- as.character(Idents(mono_obj))
+saveRDS(mono_obj, out_mono_rds)
+
+# -----------------------------#
+# Markers per mono/mac subcluster
+# -----------------------------#
+DefaultAssay(mono_obj) <- "SCT"
+
+markers_mono <- FindAllMarkers(
+  mono_obj,
+  only.pos = TRUE,
+  logfc.threshold = 0.25,
+  min.pct = 0.10
+) %>%
+  as.data.frame()
+
+write.csv(markers_mono, out_markers_csv, row.names = FALSE)
+
+top_markers_mono <- markers_mono %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 100, with_ties = FALSE) %>%
+  ungroup()
+
+wb <- createWorkbook()
+for (cl in unique(top_markers_mono$cluster)) {
+  df <- top_markers_mono %>%
+    filter(cluster == cl) %>%
+    arrange(desc(avg_log2FC))
+
+  sheet_name <- substr(paste0("Cluster_", cl), 1, 31)
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet = sheet_name, x = df)
+}
+saveWorkbook(wb, out_markers_xlsx, overwrite = TRUE)
+
+# -----------------------------#
+# Slingshot (using Seurat UMAP)
+# -----------------------------#
+sce <- as.SingleCellExperiment(mono_obj)
+reducedDims(sce)$UMAP <- Embeddings(mono_obj, "umap")
+colData(sce)$cluster <- factor(Idents(mono_obj))
+
+if (!start_cluster %in% levels(colData(sce)$cluster)) {
+  stop("start_cluster not found in mono_obj identities: ", start_cluster, call. = FALSE)
+}
+
+set.seed(123)
+sce <- slingshot(
+  sce,
+  clusterLabels = "cluster",
+  reducedDim    = "UMAP",
+  start.clus    = start_cluster
+)
+
+saveRDS(sce, out_sce_rds)
+
+pt <- slingPseudotime(sce)
+w  <- slingCurveWeights(sce)
+
+# Keep cells with valid pseudotime in lineage 1
+keep <- which(!is.na(pt[, 1]))
+if (length(keep) < 50) {
+  stop("Too few cells with valid pseudotime in lineage 1 (n = ", length(keep), ").", call. = FALSE)
+}
+
+counts_mat <- as.matrix(counts(sce))
+counts_sub <- counts_mat[, keep, drop = FALSE]
+pt_sub     <- cbind(pt[keep, 1])
+w_sub      <- cbind(w[keep, 1])
+colnames(pt_sub) <- "Lineage1"
+colnames(w_sub)  <- "Lineage1"
+
+# -----------------------------#
+# tradeSeq fitGAM + association test
+# -----------------------------#
+set.seed(123)
+sce_ts <- fitGAM(
+  counts      = counts_sub,
+  pseudotime  = pt_sub,
+  cellWeights = w_sub,
+  nknots      = nknots,
+  verbose     = TRUE
+)
+
+saveRDS(sce_ts, out_gam_rds)
+
+assoc_res <- associationTest(sce_ts) %>%
+  as.data.frame()
+
+assoc_res$padj <- p.adjust(assoc_res$pvalue, method = "BH")
+assoc_res <- assoc_res[order(assoc_res$pvalue), , drop = FALSE]
+write.csv(assoc_res, out_assoc_csv, row.names = TRUE)
+
+sig_genes <- rownames(assoc_res)[assoc_res$padj < padj_cutoff]
+writeLines(sig_genes, out_sig_txt)
+
+message("Done.\n",
+        "  Mono/mac object:              ", out_mono_rds, "\n",
+        "  Markers (all):                ", out_markers_csv, "\n",
+        "  Markers (top xlsx):           ", out_markers_xlsx, "\n",
+        "  Slingshot SCE:                ", out_sce_rds, "\n",
+        "  tradeSeq fitGAM:              ", out_gam_rds, "\n",
+        "  tradeSeq association results: ", out_assoc_csv, "\n",
+        "  Significant genes:            ", out_sig_txt)

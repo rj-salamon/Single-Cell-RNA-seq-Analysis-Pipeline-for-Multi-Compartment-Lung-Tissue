@@ -1,0 +1,415 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# 01_scRNAseq_seurat_preprocess_rjs
+#
+# Single-cell RNA-seq Preprocessing Pipeline (Seurat)
+# Author: Rebecca J. Salamon
+#
+# Purpose:
+#   Reproducible preprocessing of scRNA-seq data including
+#   QC, filtering, normalization, dimensionality reduction,
+#   cell cycle scoring, and doublet removal.
+#
+# How to run:
+#   source("scripts/01_preprocess_seurat.R")
+#
+# Inputs:
+#   data/rds/seurat_raw.rds   (or Cell Ranger filtered matrix)
+#
+# Outputs:
+#   results/seurat_preprocessed_singlets.rds
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(optparse)
+})
+
+#-----------------------------#
+# Helpers
+#-----------------------------#
+
+require_pkgs <- function(pkgs) {
+  missing <- pkgs[!vapply(pkgs, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
+  if (length(missing) > 0) {
+    stop(
+      "Missing required packages: ", paste(missing, collapse = ", "), "\n",
+      "Install them, e.g.:\n  install.packages(c(", paste0('"', missing, '"', collapse = ", "), "))\n",
+      "For Bioconductor packages, use BiocManager::install()."
+    )
+  }
+}
+
+log_step <- function(...) {
+  message(sprintf("[%s] %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), paste0(..., collapse = "")))
+}
+
+dir_create <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Gene filtering: require min.umi in at least min.cells, or use provided genes list
+FilterGenes <- function(object, min.umi = 2, min.cells = 10, genes = NULL) {
+  requireNamespace("Matrix", quietly = TRUE)
+
+  genes.use <- NULL
+  if (!is.null(genes)) {
+    genes.use <- intersect(rownames(object), genes)
+  } else {
+    counts <- Seurat::GetAssayData(object, slot = "counts")
+    num.cells <- Matrix::rowSums(counts >= min.umi)
+    genes.use <- names(num.cells[num.cells >= min.cells])
+  }
+
+  if (length(genes.use) == 0) {
+    stop("No genes passed filtering criteria. Aborting.")
+  }
+
+  Seurat::subset(object, features = genes.use)
+}
+
+# Save a ggplot safely (only if ggplot2 loaded)
+save_plot <- function(p, filename, width = 9, height = 5) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) return(invisible(FALSE))
+  ggplot2::ggsave(filename = filename, plot = p, width = width, height = height, dpi = 300)
+  invisible(TRUE)
+}
+
+#-----------------------------#
+# CLI options
+#-----------------------------#
+
+option_list <- list(
+  make_option("--input_rds", type = "character", default = "data/rds/seurat_raw.rds",
+              help = "Path to input Seurat RDS. If exists, used by default. [default %default]"),
+  make_option("--input_10x_h5", type = "character", default = NA,
+              help = "Path to Cell Ranger filtered_feature_bc_matrix.h5 (Read10X_h5). Used if input_rds not found."),
+  make_option("--project", type = "character", default = "scRNA_project",
+              help = "Project name if creating a Seurat object from 10X h5. [default %default]"),
+  make_option("--output_rds", type = "character", default = "results/seurat_preprocessed_singlets.rds",
+              help = "Output RDS path. [default %default]"),
+  make_option("--plots_dir", type = "character", default = "results/plots",
+              help = "Directory to write plots if make_plots=TRUE. [default %default]"),
+  make_option("--make_plots", type = "logical", default = FALSE,
+              help = "Whether to generate QC and diagnostic plots. [default %default]"),
+
+  # Sample rename mapping
+  make_option("--rename_RS01", type = "character", default = "saline",
+              help = "Rename orig.ident value 'RS01' to this. [default %default]"),
+  make_option("--rename_RS02", type = "character", default = "6OHDA",
+              help = "Rename orig.ident value 'RS02' to this. [default %default]"),
+
+  # QC thresholds
+  make_option("--min_features", type = "integer", default = 200,
+              help = "Minimum detected features (genes) per cell. [default %default]"),
+  make_option("--min_counts", type = "integer", default = 500,
+              help = "Minimum UMI counts per cell. [default %default]"),
+  make_option("--max_features", type = "integer", default = 5000,
+              help = "Maximum detected features (genes) per cell. [default %default]"),
+  make_option("--max_percent_mt", type = "double", default = 5,
+              help = "Maximum percent mitochondrial reads. [default %default]"),
+  make_option("--mt_pattern", type = "character", default = "^mt-",
+              help = "Regex for mitochondrial genes (mouse '^mt-' vs human '^MT-'). [default %default]"),
+
+  # Gene filtering
+  make_option("--gene_min_umi", type = "integer", default = 2,
+              help = "Min UMI per gene for gene filtering. [default %default]"),
+  make_option("--gene_min_cells", type = "integer", default = 10,
+              help = "Min cells per gene for gene filtering. [default %default]"),
+
+  # SCTransform settings
+  make_option("--variable_features_n", type = "integer", default = 4000,
+              help = "Number of variable features for SCTransform. [default %default]"),
+  make_option("--sct_ncells", type = "integer", default = 10000,
+              help = "Representative cells for SCTransform model. [default %default]"),
+  make_option("--dims", type = "integer", default = 50,
+              help = "Number of PCA dims to use for neighbors/UMAP. [default %default]"),
+
+  # Clustering
+  make_option("--resolution", type = "double", default = 0.5,
+              help = "Resolution for reclustering singlets. [default %default]"),
+
+  # Reproducibility
+  make_option("--seed", type = "integer", default = 12345,
+              help = "Random seed. [default %default]")
+)
+
+opts <- parse_args(OptionParser(option_list = option_list))
+
+#-----------------------------#
+# Package checks
+#-----------------------------#
+
+required <- c("Seurat", "Matrix", "dplyr", "scDblFinder", "SingleCellExperiment", "glmGamPoi")
+require_pkgs(required)
+
+# Optional for plots
+if (isTRUE(opts$make_plots)) {
+  require_pkgs(c("ggplot2", "viridis"))
+}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(dplyr)
+  library(glmGamPoi)
+  library(scDblFinder)
+  library(SingleCellExperiment)
+})
+if (isTRUE(opts$make_plots)) {
+  suppressPackageStartupMessages({
+    library(ggplot2)
+    library(viridis)
+  })
+}
+
+#-----------------------------#
+# Setup
+#-----------------------------#
+
+set.seed(opts$seed)
+options(stringsAsFactors = FALSE)
+
+out_dir <- dirname(opts$output_rds)
+dir_create(out_dir)
+if (isTRUE(opts$make_plots)) dir_create(opts$plots_dir)
+
+log_step("Starting preprocessing")
+
+#-----------------------------#
+# Load data: RDS preferred; else 10X h5
+#-----------------------------#
+
+seurat_obj <- NULL
+
+if (!is.na(opts$input_rds) && file.exists(opts$input_rds)) {
+  log_step("Loading Seurat object from RDS: ", opts$input_rds)
+  seurat_obj <- readRDS(opts$input_rds)
+} else if (!is.na(opts$input_10x_h5) && file.exists(opts$input_10x_h5)) {
+  log_step("RDS not found; creating Seurat object from 10X h5: ", opts$input_10x_h5)
+  counts <- Read10X_h5(opts$input_10x_h5, use.names = TRUE, unique.features = TRUE)
+  seurat_obj <- CreateSeuratObject(
+    counts = counts,
+    project = opts$project,
+    min.cells = 0,
+    min.features = 0
+  )
+} else {
+  stop(
+    "No valid input found.\n",
+    "Checked input_rds: ", opts$input_rds, "\n",
+    "Checked input_10x_h5: ", opts$input_10x_h5
+  )
+}
+
+if (!"orig.ident" %in% colnames(seurat_obj@meta.data)) {
+  log_step("orig.ident not present; creating orig.ident = project")
+  seurat_obj$orig.ident <- opts$project
+}
+
+log_step("orig.ident counts (before rename):")
+print(table(seurat_obj$orig.ident))
+
+# Rename RS01/RS02 if present
+seurat_obj$orig.ident <- dplyr::recode(
+  seurat_obj$orig.ident,
+  "RS01" = opts$rename_RS01,
+  "RS02" = opts$rename_RS02,
+  .default = as.character(seurat_obj$orig.ident)
+)
+
+log_step("orig.ident counts (after rename):")
+print(table(seurat_obj$orig.ident))
+
+#-----------------------------#
+# Initial QC: remove empty droplets / very low-quality cells
+#-----------------------------#
+
+log_step("Initial QC thresholds: min_features=", opts$min_features, ", min_counts=", opts$min_counts)
+log_step("Before initial QC: cells=", ncol(seurat_obj), ", genes=", nrow(seurat_obj))
+
+seurat_obj <- subset(
+  seurat_obj,
+  subset = nFeature_RNA > opts$min_features & nCount_RNA > opts$min_counts
+)
+
+log_step("After initial QC: cells=", ncol(seurat_obj))
+
+#-----------------------------#
+# Mito percent + QC filtering
+#-----------------------------#
+
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = opts$mt_pattern)
+
+initial_cells <- ncol(seurat_obj)
+log_step("percent.mt summary:")
+print(summary(seurat_obj$percent.mt))
+
+log_step(
+  "Filtering: nFeature_RNA in (",
+  opts$min_features, ", ", opts$max_features,
+  "), percent.mt < ", opts$max_percent_mt
+)
+
+seurat_obj <- subset(
+  seurat_obj,
+  subset =
+    nFeature_RNA > opts$min_features &
+    nFeature_RNA < opts$max_features &
+    percent.mt < opts$max_percent_mt &
+    !is.na(percent.mt)
+)
+
+filtered_cells <- ncol(seurat_obj)
+log_step("Cells after QC: ", filtered_cells,
+         " (removed ", initial_cells - filtered_cells,
+         ", ", round(100 * (initial_cells - filtered_cells) / initial_cells, 2), "%)")
+
+# Optional QC plots
+if (isTRUE(opts$make_plots)) {
+  log_step("Generating QC plots")
+  p_vln <- VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+                   ncol = 3, raster = FALSE)
+  save_plot(p_vln, file.path(opts$plots_dir, "qc_violin.png"), width = 12, height = 5)
+
+  p_sc1 <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "percent.mt", pt.size = 0.4, shuffle = TRUE)
+  save_plot(p_sc1, file.path(opts$plots_dir, "qc_scatter_nCount_vs_percentmt.png"), width = 7, height = 5)
+
+  p_sc2 <- FeatureScatter(seurat_obj, feature1 = "nFeature_RNA", feature2 = "percent.mt", pt.size = 0.4, shuffle = TRUE)
+  save_plot(p_sc2, file.path(opts$plots_dir, "qc_scatter_nFeature_vs_percentmt.png"), width = 7, height = 5)
+
+  p_sc3 <- FeatureScatter(seurat_obj, feature1 = "nFeature_RNA", feature2 = "nCount_RNA", pt.size = 0.4, shuffle = TRUE)
+  save_plot(p_sc3, file.path(opts$plots_dir, "qc_scatter_nFeature_vs_nCount.png"), width = 7, height = 5)
+}
+
+#-----------------------------#
+# Gene filtering
+#-----------------------------#
+
+log_step("Gene filtering: min_umi=", opts$gene_min_umi, ", min_cells=", opts$gene_min_cells)
+seurat_obj <- FilterGenes(
+  object = seurat_obj,
+  min.umi = opts$gene_min_umi,
+  min.cells = opts$gene_min_cells
+)
+log_step("After gene filtering: genes=", nrow(seurat_obj))
+
+#-----------------------------#
+# SCTransform + PCA/Neighbors/UMAP
+#-----------------------------#
+
+log_step("Running SCTransform (glmGamPoi backend), variable.features.n=", opts$variable_features_n)
+seurat_obj <- SCTransform(
+  seurat_obj,
+  vst.flavor = "v2",
+  method = "glmGamPoi",
+  variable.features.n = opts$variable_features_n,
+  ncells = opts$sct_ncells,
+  conserve.memory = TRUE,
+  verbose = TRUE
+)
+
+log_step("Running PCA/Neighbors/Clusters/UMAP using dims=1:", opts$dims)
+seurat_obj <- RunPCA(seurat_obj, verbose = TRUE)
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:opts$dims)
+seurat_obj <- FindClusters(seurat_obj)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:opts$dims)
+
+if (isTRUE(opts$make_plots)) {
+  p_umap_id <- DimPlot(seurat_obj, reduction = "umap", group.by = "orig.ident", shuffle = TRUE) +
+    ggplot2::theme_minimal()
+  save_plot(p_umap_id, file.path(opts$plots_dir, "umap_by_sample.png"), width = 7, height = 5)
+
+  p_elbow <- ElbowPlot(seurat_obj, ndims = opts$dims)
+  save_plot(p_elbow, file.path(opts$plots_dir, "pca_elbow.png"), width = 7, height = 5)
+}
+
+#-----------------------------#
+# Cell cycle scoring
+#-----------------------------#
+
+log_step("Cell cycle scoring")
+# Seurat provides cc.genes (older) and cc.genes.updated.2019 (newer); prefer updated if available
+if (exists("cc.genes.updated.2019", where = asNamespace("Seurat"), inherits = FALSE)) {
+  cc <- get("cc.genes.updated.2019", envir = asNamespace("Seurat"))
+  s.genes <- cc$s.genes
+  g2m.genes <- cc$g2m.genes
+} else if (exists("cc.genes", where = asNamespace("Seurat"), inherits = FALSE)) {
+  cc <- get("cc.genes", envir = asNamespace("Seurat"))
+  s.genes <- cc$s.genes
+  g2m.genes <- cc$g2m.genes
+} else {
+  stop("Could not find Seurat cell cycle gene lists (cc.genes / cc.genes.updated.2019).")
+}
+
+seurat_obj <- CellCycleScoring(
+  seurat_obj,
+  s.features = s.genes,
+  g2m.features = g2m.genes,
+  set.ident = FALSE
+)
+log_step("Cell cycle Phase counts:")
+print(table(seurat_obj$Phase))
+
+if (isTRUE(opts$make_plots)) {
+  p_umap_phase <- DimPlot(seurat_obj, group.by = "Phase", reduction = "umap", shuffle = TRUE) +
+    scale_color_viridis_d() +
+    ggplot2::theme_minimal()
+  save_plot(p_umap_phase, file.path(opts$plots_dir, "umap_by_phase.png"), width = 7, height = 5)
+}
+
+#-----------------------------#
+# Doublet detection (scDblFinder) + singlet filtering
+#-----------------------------#
+
+log_step("Running scDblFinder")
+options(future.globals.maxSize = 1000 * 1024^2)
+
+DefaultAssay(seurat_obj) <- "SCT"
+Idents(seurat_obj) <- "seurat_clusters"
+
+sce <- as.SingleCellExperiment(seurat_obj)
+sce <- scDblFinder(sce)
+
+seurat_obj$scDblFinder.class <- sce$scDblFinder.class
+seurat_obj$scDblFinder.score <- sce$scDblFinder.score
+
+log_step("scDblFinder classifications:")
+print(table(seurat_obj$scDblFinder.class))
+
+n_doublets <- sum(seurat_obj$scDblFinder.class == "doublet", na.rm = TRUE)
+n_total <- ncol(seurat_obj)
+log_step("Doublets detected: ", n_doublets, " / ", n_total,
+         " (", round(100 * n_doublets / n_total, 2), "%)")
+
+log_step("Keeping singlets only")
+seurat_obj <- subset(seurat_obj, subset = scDblFinder.class == "singlet")
+log_step("Cells after singlet filter: ", ncol(seurat_obj))
+
+#-----------------------------#
+# Recluster singlets
+#-----------------------------#
+
+log_step("Reclustering singlets, resolution=", opts$resolution)
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:opts$dims)
+seurat_obj <- FindClusters(seurat_obj, resolution = opts$resolution)
+
+if (isTRUE(opts$make_plots)) {
+  p_umap_cluster <- DimPlot(seurat_obj, reduction = "umap", label = TRUE, pt.size = 0.4, shuffle = TRUE) +
+    ggplot2::theme_minimal()
+  save_plot(p_umap_cluster, file.path(opts$plots_dir, "umap_singlets_clusters.png"), width = 7, height = 5)
+}
+
+#-----------------------------#
+# Save outputs
+#-----------------------------#
+
+log_step("Saving processed Seurat object: ", opts$output_rds)
+saveRDS(seurat_obj, opts$output_rds)
+
+# Save session info for reproducibility
+sess_path <- file.path(out_dir, "sessionInfo.txt")
+log_step("Writing sessionInfo: ", sess_path)
+writeLines(c(capture.output(sessionInfo())), con = sess_path)
+
+log_step("Done.")
