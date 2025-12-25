@@ -3,6 +3,9 @@
 # 08_cell_chat_immune_mesenchymal_rjs
 #
 # CellChat analysis for Mesenchymal ↔ Immune communication, split by condition.
+# Author: Rebecca J. Salamon
+#
+#
 # Uses fine-grained labels:
 #   - Mesenchymal: mes_identity
 #   - Immune: subcluster_identity (mono/mac) when present, else imm_identity

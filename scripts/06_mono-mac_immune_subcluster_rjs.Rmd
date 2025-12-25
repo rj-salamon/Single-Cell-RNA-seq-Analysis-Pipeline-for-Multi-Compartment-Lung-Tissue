@@ -3,6 +3,7 @@
 # 06_mono-mac_immune_subcluster_rjs
 #
 # Immune compartment reclustering + monocyte/macrophage subclustering.
+# Author: Rebecca J. Salamon
 #
 # Inputs:
 #   results/seurat_obj_mesenchymal_immune_merged.rds

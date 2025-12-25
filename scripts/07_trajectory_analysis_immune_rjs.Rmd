@@ -3,6 +3,7 @@
 # 07_trajectory_analysis_immune_rjs
 #
 # Monocyte/macrophage trajectory analysis using Slingshot + tradeSeq.
+# Author: Rebecca J. Salamon
 #
 # Inputs:
 #   results/immune_obj_reclustered.rds
