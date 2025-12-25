@@ -161,10 +161,6 @@ Run the analysis in order using the `.Rmd` files in `notebooks/` (or render them
 ### CellChat
 - `min.cells = 10` in `filterCommunication`
 
-## Reproducibility
-R package versions can be captured using either:
-- `sessionInfo()` (saved to `results/sessionInfo.txt`), or  
-- `renv` (recommended), generating an `renv.lock` file
 
 ## Notes on cell type labels used for CellChat
 CellChat grouping is defined using a single metadata column:
